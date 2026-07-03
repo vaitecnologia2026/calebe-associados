@@ -39,7 +39,7 @@
 .cv2 .item.disc{opacity:.5}
 .cv2 .strip{position:absolute;left:0;top:0;bottom:0;width:3px}
 .cv2 .av{width:48px;height:48px;border-radius:50%;flex:none;display:grid;place-items:center;font-weight:700;font-size:17px;background:linear-gradient(135deg,#123a52,#0c2438);color:var(--gold);border:1px solid #1c3a52;position:relative}
-.cv2 .av .wa{position:absolute;right:-2px;bottom:-2px;width:17px;height:17px;border-radius:50%;background:#075E54;display:grid;place-items:center;border:2px solid var(--bg2);font-size:9px}
+.cv2 .av .wa-dot{position:absolute;right:0;bottom:0;width:13px;height:13px;border-radius:50%;background:var(--green);border:2.5px solid var(--bg2)}
 .cv2 .it-body{flex:1;min-width:0}
 .cv2 .it-top{display:flex;align-items:center;gap:8px}
 .cv2 .it-name{font-weight:700;font-size:14.5px;color:var(--cream);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
@@ -49,11 +49,17 @@
 .cv2 .it-msg{font-size:13px;color:var(--cream-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
 .cv2 .it-msg.unread{color:var(--cream);font-weight:600}
 .cv2 .unreadn{background:var(--green);color:#04101F;min-width:20px;height:20px;border-radius:999px;display:grid;place-items:center;font-size:11px;font-weight:800;flex:none}
-.cv2 .it-meta{display:flex;align-items:center;gap:7px;margin-top:6px}
+.cv2 .it-meta{display:flex;align-items:center;gap:7px;margin-top:6px;flex-wrap:wrap;row-gap:4px}
 .cv2 .tag{font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:6px;border:1px solid var(--line);color:var(--cream-dim);background:#0a1f31}
 .cv2 .dot{width:8px;height:8px;border-radius:50%;flex:none}
 .cv2 .st{font-size:11px;font-weight:700;display:flex;align-items:center;gap:5px}
 .cv2 .msgs{font-size:10.5px;color:var(--muted);font-weight:600}
+.cv2 .pin-btn{background:none;border:none;cursor:pointer;padding:0 2px;line-height:1;flex:none;color:var(--muted);opacity:.32;display:grid;place-items:center}
+.cv2 .pin-btn.on{opacity:1;color:var(--gold)}
+.cv2 .pin-btn:hover{opacity:.8}
+.cv2 .redist-chip{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;color:#f97316;background:rgba(249,115,22,.14);border:1px solid rgba(249,115,22,.4);border-radius:5px;padding:2px 6px;white-space:nowrap}
+.cv2 .redist-chip[data-urgent="1"]{color:#ff4444;background:rgba(255,68,68,.14);border-color:rgba(255,68,68,.4)}
+.cv2 .redist-chip svg{flex:none}
 /* Selo da janela de 24h (Meta) — verde delicado + contagem; ambar quando fechada */
 .cv2 .winbadge{display:inline-flex;align-items:center;gap:5px;margin-top:5px;font-size:10.5px;font-weight:600;letter-spacing:.2px;line-height:1.2}
 .cv2 .winbadge::before{content:"";width:6px;height:6px;border-radius:50%;flex:none}
@@ -208,7 +214,7 @@
   /* item compacto + sem estourar a largura */
   .cv2 .item{padding:10px 12px;gap:10px;align-items:center}
   .cv2 .av{width:42px;height:42px;font-size:15px}
-  .cv2 .av .wa{width:15px;height:15px;font-size:8px}
+  .cv2 .av .wa-dot{width:12px;height:12px}
   .cv2 .it-body{min-width:0}
   .cv2 .it-top{gap:6px}
   .cv2 .it-name{font-size:13.5px;min-width:0}      /* menor, ainda em destaque; ellipsis ok */

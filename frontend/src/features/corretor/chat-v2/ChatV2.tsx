@@ -14,7 +14,7 @@ import {
 import { resolveBackendUrl } from "@/lib/media";
 import { NovaVendaModal } from "@/features/corretor/components/NovaVendaModal";
 import { useAuth } from "@/store/auth";
-import { Headphones, Handshake, BadgeCheck, Phone, Home, DollarSign, Trash2, MoreVertical, ChevronUp, ChevronDown, MessageCircle, Smartphone } from "lucide-react";
+import { Headphones, Handshake, BadgeCheck, Phone, Home, DollarSign, Trash2, MoreVertical, ChevronUp, ChevronDown, MessageCircle, Smartphone, Pin, AlertTriangle } from "lucide-react";
 import "./chat-v2.css";
 
 const STAGES = ["Novo", "Qualificando", "Negociação", "Fechamento", "Ganho", "Perdido"];
@@ -437,21 +437,19 @@ export function CorretorChatV2() {
                 )}
                 <div className={"item" + (c.st === "discarded" ? " disc" : "") + (activeId === c.id ? " active" : "") + (redistRisk ? " redist-risk" : "")} onClick={() => openChat(c)}>
                   <span className={"strip bg-" + (redistRisk ? "red" : s.cls)} />
-                  <div className="av" translate="no">{initials(c.n)}<span className="wa">🟢</span></div>
+                  <div className="av" translate="no">{initials(c.n)}<span className="wa-dot" /></div>
                   <div className="it-body">
-                    <div className="it-top"><span className="it-name">{c.pinned ? "📌 " : ""}{c.n}</span><button type="button" title={c.pinned ? "Desafixar" : "Fixar no topo"} onClick={(e) => togglePin(c, e)} style={{ background: "none", border: "none", cursor: "pointer", padding: "0 2px", fontSize: 13, lineHeight: 1, opacity: c.pinned ? 1 : 0.32, filter: c.pinned ? "none" : "grayscale(1)", flex: "none" }}>📌</button><span className={"it-time" + (c.unread ? " green" : "")}>{c.t}</span></div>
+                    <div className="it-top">
+                      <span className="it-name">{c.n}</span>
+                      <button type="button" className={"pin-btn" + (c.pinned ? " on" : "")} title={c.pinned ? "Desafixar" : "Fixar no topo"} onClick={(e) => togglePin(c, e)}><Pin size={13} /></button>
+                      <span className={"it-time" + (c.unread ? " green" : "")}>{c.t}</span>
+                    </div>
                     <div className="it-prev"><span className={"it-msg" + (c.unread ? " unread" : "")}>{c.last}</span>{c.unread ? <span className="unreadn">{c.unread}</span> : null}</div>
-                    <div className="it-meta"><span className="tag">{c.org}</span><span className={"st c-" + s.cls}><i className={"dot bg-" + s.cls} />{s.label}</span><span className="msgs">· {c.msgs} msg</span>{c.phone ? <span className="msgs">· 📞 {c.phone}</span> : null}</div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                      <WindowBadge open={c.win} ms={c.lastInbound} />
+                    <div className="it-meta">
+                      <span className={"st c-" + s.cls}><i className={"dot bg-" + s.cls} />{s.label}</span>
                       {redistRisk && (
-                        <span title="Esse lead será redistribuído para outro corretor se não for respondido"
-                          style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 10.5, fontWeight: 700,
-                            color: hoursLeft === 0 ? "#ff4444" : "#f97316",
-                            background: hoursLeft === 0 ? "rgba(255,68,68,.14)" : "rgba(249,115,22,.14)",
-                            border: `1px solid ${hoursLeft === 0 ? "rgba(255,68,68,.4)" : "rgba(249,115,22,.4)"}`,
-                            borderRadius: 5, padding: "2px 6px", whiteSpace: "nowrap" }}>
-                          ⚠ {hoursLeft !== null && hoursLeft > 0 ? `redistribui em ${hoursLeft}h` : "redistribui em breve!"}
+                        <span className="redist-chip" data-urgent={hoursLeft === 0 ? "1" : "0"} title="Esse lead será redistribuído para outro corretor se não for respondido">
+                          <AlertTriangle size={11} /> {hoursLeft !== null && hoursLeft > 0 ? `redistribui em ${hoursLeft}h` : "redistribui em breve!"}
                         </span>
                       )}
                     </div>

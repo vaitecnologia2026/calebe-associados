@@ -56,12 +56,18 @@ async function registerToken(token: string, platform: string): Promise<void> {
 export async function setupNativePush(): Promise<void> {
   const c = cap();
   if (!c) return;
+  // Push nativo SÓ no iOS. No Android o app inclui o plugin PushNotifications
+  // mas NÃO tem google-services.json — chamar register() dispara, na thread
+  // NATIVA (fora do try/catch), "Default FirebaseApp is not initialized" e
+  // CRASHA o app em loop ao entrar. Mesmo guard do calebe-native-push.js.
+  // NÃO remover sem antes adicionar Firebase (google-services.json) ao Android.
+  const platform = c.getPlatform ? c.getPlatform() : "ios";
+  if (platform !== "ios") return;
   if (_started) return;
   _started = true;
 
   const PushNotifications = c.Plugins?.PushNotifications;
   const Preferences = c.Plugins?.Preferences;
-  const platform = c.getPlatform ? c.getPlatform() : "ios";
   if (!PushNotifications) { _started = false; return; }
 
   try {
