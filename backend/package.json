@@ -1,0 +1,47 @@
+{
+  "name": "crm-calebe-associados-backend",
+  "version": "1.0.0",
+  "description": "API REST do CRM Calebe Associados — produção",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "node prisma/seed.js",
+    "db:studio": "prisma studio"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  },
+  "dependencies": {
+    "@prisma/client": "5.22.0",
+    "bcryptjs": "2.4.3",
+    "cookie-parser": "1.4.6",
+    "cors": "2.8.5",
+    "csv-parse": "5.6.0",
+    "dotenv": "16.4.5",
+    "express": "4.21.2",
+    "express-rate-limit": "7.4.1",
+    "firebase-admin": "^13.10.0",
+    "ioredis": "^5.11.0",
+    "jsonwebtoken": "9.0.2",
+    "minio": "8.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.20.0",
+    "pino": "9.5.0",
+    "pino-http": "10.3.0",
+    "pino-pretty": "11.3.0",
+    "web-push": "^3.6.7",
+    "xlsx": "0.18.5",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "prisma": "5.22.0"
+  }
+}

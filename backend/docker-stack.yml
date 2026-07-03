@@ -1,0 +1,92 @@
+# =============================================================================
+# docker-stack.yml · Docker Swarm (produção)
+# Deploy:  docker stack deploy -c docker-stack.yml calebe
+# =============================================================================
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: ${POSTGRES_DB:-crm_calebe}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [calebe-net]
+    secrets: [postgres_password]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      update_config:
+        order: stop-first
+      restart_policy:
+        condition: any
+        delay: 10s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_password
+    volumes:
+      - minio-data:/data
+    networks: [calebe-net]
+    secrets: [minio_password]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]
+      update_config:
+        order: stop-first
+
+  api:
+    image: calebe/crm-backend:latest
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/crm_calebe?schema=public
+      DIRECT_URL:   postgresql://postgres:${POSTGRES_PASSWORD}@postgres:5432/crm_calebe?schema=public
+      MINIO_ENDPOINT: minio
+    networks: [calebe-net]
+    ports: ["4000:4000"]
+    depends_on: [postgres, minio]
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 10s
+      restart_policy:
+        condition: any
+        delay: 5s
+        max_attempts: 5
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+      healthcheck:
+        test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/health"]
+        interval: 30s
+        timeout: 5s
+        retries: 3
+
+volumes:
+  postgres-data:
+  minio-data:
+
+networks:
+  calebe-net:
+    driver: overlay
+    attachable: true
+
+secrets:
+  postgres_password:
+    external: true
+  minio_password:
+    external: true

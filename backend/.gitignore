@@ -1,0 +1,30 @@
+node_modules/
+.env
+.env.local
+.env.production
+*.log
+.DS_Store
+dist/
+build/
+prisma/migrations/dev.db*
+coverage/
+
+# === BLINDAGEM-CLAUDE: segredos, backups, midia e PII (NUNCA versionar) ===
+.env
+.env.*
+*.bak
+*.bak-*
+*.bak.*
+*.bak_*
+Midias/
+failed_emails.txt
+# scripts ad-hoc de disparo/diagnostico (podem conter PII/numeros/segredos)
+_*.mjs
+_*.cjs
+blast*.mjs
+dryrun*.mjs
+docker-compose.yml
+
+secrets/
+.tpl-cache.json
+data/healthy_phones.json

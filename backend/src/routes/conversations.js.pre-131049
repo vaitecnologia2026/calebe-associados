@@ -1,0 +1,1337 @@
+// =============================================================================
+// /api/conversations · mensagens, envio via VAI, rastreio de primeiroContato
+// =============================================================================
+import { Router } from "express";
+import multer from "multer";
+import { z } from "zod";
+import { writeFile } from "node:fs/promises";
+import { mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { db } from "../db.js";
+import { requireAuth, requireRole } from "../auth/middleware.js";
+import { vaiSendSafe, vaiOnboardLeadSafe, vaiUploadFile, vaiSendChatMessage, vaiEnsureChatForContact, vaiListChatMessages, vaiCreateChat, vaiStartService, vaiCloseChat, vaiSendOutboundFresh, isVaiActivity } from "../services/vaiClient.js";
+import { decrypt as decryptPhone } from "../crypto.js";
+import { phoneAllowed } from "../services/leadPhoneAccess.js";
+// 2026-05-20 · transcode de áudio extraído pra services/audioTranscode.js
+// (mesma função, sem mudança de contrato — só desacopla do roteador).
+import { transcodeAudioToOgg } from "../services/audioTranscode.js";
+import { windowState, lastInboundFrom } from "../services/whatsappWindow.js";
+
+// Map in-memory · convId → timestamp do último auto-heal.
+// 2026-05-06 · TTL reduzido de 30min → 5min: quando o WhatsApp da VAI volta
+// (ex.: corretor reconecta no painel), o sistema retoma rebind/redelivery em
+// até 5min em vez de bloquear por meia hora. Continua suficiente pra evitar
+// rebind em loop durante uma queda real, sem prolongar a indisponibilidade.
+const _autoHealedConvs = new Map();
+const _AUTO_HEAL_TTL_MS = 5 * 60 * 1000;
+const _hasAutoHealed = (id) => {
+  const t = _autoHealedConvs.get(id);
+  if (!t) return false;
+  if (Date.now() - t > _AUTO_HEAL_TTL_MS){ _autoHealedConvs.delete(id); return false; }
+  return true;
+};
+
+// 2026-05-07 · cache de chat fresco recente · convId -> { vaiConvId, lastSuccessAt }
+//   Após primeira msg via vaiSendOutboundFresh (close-all + create + send), salva
+//   o chatId fresco aqui. Mensagens subsequentes (dentro do TTL) REUSAM esse chat
+//   via vaiSendChatMessage direto, em vez de fechar/criar de novo a cada msg.
+//   Motivo: VAI/WhatsApp Web não dispara mensagens em rajada de close+create
+//   consecutivos · 1ª chega, 2ª-Nª desaparecem silenciosamente.
+//   Se o reuse falhar (chat fechado externamente, etc), cai no fluxo OUTBOUND-FRESH.
+const _freshChatReuseCache = new Map();
+const _FRESH_REUSE_TTL_MS = 10 * 60 * 1000;
+const _getFreshReuse = (id) => {
+  const c = _freshChatReuseCache.get(id);
+  if (!c) return null;
+  if (Date.now() - c.lastSuccessAt > _FRESH_REUSE_TTL_MS){
+    _freshChatReuseCache.delete(id);
+    return null;
+  }
+  return c;
+};
+const _setFreshReuse = (id, vaiConvId) => {
+  _freshChatReuseCache.set(id, { vaiConvId, lastSuccessAt: Date.now() });
+};
+import { chatUpsertConversation, chatInsertMessage } from "../chatDb.js";
+import { sseToAdmins, sseStats, sseToMany } from "../services/sseHub.js";
+import { logger } from "../utils/logger.js";
+import { audit } from "../utils/audit.js";
+import { decrypt } from "../crypto.js";
+// 2026-05-13 · Migracao outbound corretor->lead p/ Meta Cloud · VAI estava com
+// sessao caida (424 msgs sem entrega em 24h). Cloud e tentativa primaria; VAI
+// vira fallback so quando Cloud retorna erro nao-recoverable diferente de
+// reengagement. Dentro da janela 24h manda free-form; fora da janela retorna
+// erro explicito p/ corretor reabordar via template.
+import {
+  sendText    as cloudSendText,
+  isEnabled   as cloudEnabled,
+  uploadMedia as cloudUploadMedia,
+  sendMedia   as cloudSendMedia,
+  uploadAndSendMedia as cloudUploadAndSendMedia
+} from "../services/whatsappCloud.js";
+
+// 2026-05-15 · /midias/outbound/<kind>/<id>.<ext> · serve mídia outbound do
+// corretor pra que iOS Safari consiga tocar (S3 .ogg/opus da VAI não toca no
+// Safari) e pra termos cópia local de tudo que mandamos.
+const PROJECT_ROOT       = path.resolve(process.cwd(), "..");
+const OUTBOUND_DIR       = path.join(PROJECT_ROOT, "Midias", "outbound");
+const OUTBOUND_AUDIO_DIR = path.join(OUTBOUND_DIR, "audio");
+for (const sub of ["audio", "image", "video", "document", "file"]){
+  try { mkdirSync(path.join(OUTBOUND_DIR, sub), { recursive: true }); } catch {}
+}
+
+// 2026-05-15 · Limites e MIMEs aceitos pela Meta WhatsApp Cloud API.
+// Checados antes do uploadMedia pra dar erro claro em vez de deixar Meta
+// retornar "media format not supported" / "file too large" obscuros.
+const META_MEDIA_LIMITS_MB = { audio: 16, image: 5, video: 16, document: 100, file: 100 };
+const META_ALLOWED_MIMES = {
+  audio:    /^audio\/(aac|amr|mp4|mpeg|ogg)$/,
+  image:    /^image\/(jpeg|png)$/,
+  video:    /^video\/(mp4|3gpp?)$/,
+  document: /^(application\/(pdf|msword|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-(excel|powerpoint))|text\/plain)$/,
+  file:     /^(application\/(pdf|msword|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-(excel|powerpoint))|text\/plain)$/
+};
+const _extFromMime = (m) => {
+  const t = String(m||"").toLowerCase();
+  if (t.includes("jpeg")) return "jpg";
+  if (t.includes("png"))  return "png";
+  if (t.includes("mp4") && t.startsWith("video")) return "mp4";
+  if (t.includes("3gp"))  return "3gp";
+  if (t.includes("pdf"))  return "pdf";
+  if (t.includes("ogg"))  return "ogg";
+  if (t.includes("opus")) return "ogg";
+  if (t.includes("mpeg") && t.startsWith("audio")) return "mp3";
+  if (t.includes("mp4") && t.startsWith("audio")) return "m4a";
+  if (t.includes("aac"))  return "aac";
+  return (t.split("/")[1] || "bin").replace(/[^a-z0-9]/g,"").slice(0,5);
+};
+
+const r = Router();
+const uploadMedia = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+
+// 2026-05-25 · F1 Éder · Helpers de assistência em conversa.
+// Importação tardia pra evitar ciclo (assists.js → conversations.js).
+import { wireRequestAssist, getActiveAssistConvIdsForUser, findActiveAssistForUser } from "./assists.js";
+
+// Monta POST /api/conversations/:id/request-assist neste router.
+wireRequestAssist(r);
+
+function guessContentType(mime){
+  if (!mime) return "file";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime.startsWith("video/")) return "video";
+  if (mime === "application/pdf" || mime.includes("document") || mime.includes("msword") || mime.includes("spreadsheet")) return "document";
+  return "file";
+}
+
+// POST /api/conversations/ensure-by-lead
+// Garante que existe Conversation pra um leadId atribuido ao associate (cria se faltar).
+// Why: leads distribuidos pela engine so ganham Conversation no 1o inbound do WhatsApp,
+// entao a aba Leads do corretor mostrava lead sem chat e o click nao abria nada.
+r.post("/ensure-by-lead", requireAuth, async (req, res, next) => {
+  try {
+    const leadId = String(req.body?.leadId || "").trim();
+    if (!leadId) return res.status(400).json({ error: "leadId required" });
+    const lead = await db.lead.findUnique({ where: { id: leadId }, select: { id: true, assignedToId: true, name: true } });
+    if (!lead) return res.status(404).json({ error: "lead_not_found" });
+
+    let associateId;
+    if (req.user.role === "ADMIN"){
+      associateId = lead.assignedToId;
+      if (!associateId) return res.status(409).json({ error: "lead_unassigned" });
+    } else if (req.user.role === "ASSOCIATE"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (!a) return res.status(403).json({ error: "not_an_associate" });
+      if (lead.assignedToId !== a.id) return res.status(403).json({ error: "forbidden" });
+      associateId = a.id;
+    } else {
+      return res.status(403).json({ error: "forbidden" });
+    }
+
+    const existing = await db.conversation.findUnique({ where: { leadId: lead.id } });
+    if (existing){
+      // Lead foi reatribuido sem o assign() rodar (ex: edicao direta via admin), entao
+      // a Conversation ainda aponta pro corretor antigo. Como o Lead ja foi validado
+      // como pertencente ao associateId atual, podemos transferir a Conversation.
+      if (existing.associateId !== associateId){
+        const transferred = await db.conversation.update({
+          where: { id: existing.id },
+          data: { associateId }
+        });
+        logger.info({ leadId: lead.id, convId: existing.id, fromAssoc: existing.associateId, toAssoc: associateId, by: req.user.email }, "🔁 conv ensure-by-lead transferiu Conversation");
+        try {
+          sseToUser(req.user.id, "conv.created", {
+            conversationId: transferred.id, leadId: lead.id, leadName: lead.name,
+            source: "ensure_by_lead_transfer", at: new Date().toISOString()
+          });
+        } catch {}
+        return res.json({ conversation: transferred, created: false, transferred: true });
+      }
+      return res.json({ conversation: existing, created: false });
+    }
+    const conv = await db.conversation.create({ data: { leadId: lead.id, associateId } });
+    try {
+      sseToUser(req.user.id, "conv.created", {
+        conversationId: conv.id, leadId: lead.id, leadName: lead.name,
+        source: "ensure_by_lead", at: new Date().toISOString()
+      });
+    } catch {}
+    logger.info({ leadId: lead.id, convId: conv.id, associateId, by: req.user.email }, "🆕 conv ensure-by-lead criou Conversation");
+    res.json({ conversation: conv, created: true });
+  } catch (e){ next(e); }
+});
+
+// GET /api/conversations — ADMIN vê todas · ASSOCIATE vê só as suas + assistidas · demais roles nada
+r.get("/", requireAuth, async (req, res, next) => {
+  try {
+    let where;
+    let filterDesc = "";
+    let assistedConvIds = [];   // 2026-05-25 · F1 Éder · conversas onde sou suporte ativo
+
+    if (req.user.role === "ADMIN"){
+      where = {};
+      filterDesc = "ADMIN_ALL";
+    } else if (req.user.role === "ASSOCIATE"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (!a){
+        logger.info({ userId: req.user.id, email: req.user.email, role: req.user.role }, "🔍 conv_list · ASSOCIATE sem record · retorna vazio");
+        return res.json({ data: [] });
+      }
+      // 2026-05-25 · Inclui conversas assistidas (pedidos de ajuda PENDING).
+      // Lead permanece na carteira do corretor original (a Conversation.associateId
+      // não muda); o assistente vê uma janela DUPLICADA.
+      assistedConvIds = await getActiveAssistConvIdsForUser(req.user.id);
+      if (assistedConvIds.length){
+        where = { OR: [{ associateId: a.id }, { id: { in: assistedConvIds } }] };
+        filterDesc = `ASSOC:${a.id} + ASSIST:${assistedConvIds.length}`;
+      } else {
+        where = { associateId: a.id };
+        filterDesc = `ASSOC:${a.id}`;
+      }
+    } else {
+      return res.json({ data: [] });
+    }
+    // 2026-05-27 · Win 2 (conservador) · 100% backward-compatible.
+    //   - Default igual ao anterior (200) e clamp em 10000 (igual antes).
+    //   - `_count` continua incluso por DEFAULT (admin Monitoramento usa).
+    //     Opt-out via ?includeCount=0 quando o caller não precisa (economiza
+    //     subquery `_count` por conv · vale pena no GET /my do corretor).
+    //   - Adiciona cursor-based pagination opcional (?cursor=<convId>) · não
+    //     muda contrato pra quem ignora.
+    const _qLimit = parseInt(req.query.limit, 10);
+    const _take = Math.min(Math.max(Number.isFinite(_qLimit) ? _qLimit : 200, 1), 10000);
+    const _cursor = typeof req.query.cursor === "string" && req.query.cursor.length > 5 ? req.query.cursor : null;
+    // _count incluso por default (compat); opt-out via ?includeCount=0 ou false
+    const _includeCount = !(req.query.includeCount === "0" || req.query.includeCount === "false");
+
+    const queryArgs = {
+      where, take: _take, orderBy: { lastMessageAt: "desc" },
+      include: {
+        // 2026-05-12 · admin precisa do phoneEncrypted pra decrypt e mostrar tel real (atalho WhatsApp na tabela)
+        lead: { select: { id:true, name:true, phoneMasked:true, phoneEncrypted:true, origin:true, segment:true, status:true, firstContactAt:true, assignedAt:true, redistributionCount:true } },
+        associate: { select: { id:true, phone:true, whatsapp:true, user: { select: { id:true, name:true, email:true } } } },
+        messages: {
+          where: { hiddenAt: null },
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          select: { text:true, direction:true, contentType:true, createdAt:true, fromRole:true }
+        },
+        // 2026-05-27 · _count é caro (subquery por conv) · default incluso pra
+        // não quebrar admin · opt-out via ?includeCount=0 quando perf importar.
+        ...(_includeCount ? { _count: { select: { messages: true } } } : {})
+      }
+    };
+    if (_cursor){
+      queryArgs.cursor = { id: _cursor };
+      queryArgs.skip = 1;  // pula o item do cursor (Prisma cursor-based pattern)
+    }
+    const data = await db.conversation.findMany(queryArgs);
+    // nextCursor pra próxima página · null quando acabou
+    const nextCursor = data.length === _take ? data[data.length - 1].id : null;
+    // 2026-05-12 · Admin recebe phone real (decrypt). Não-admin nunca recebe phoneEncrypted no payload.
+    // 2026-05-25 · Assistente (F1 Éder) também recebe phone real nas conversas que está assistindo.
+    const assistedSet = new Set(assistedConvIds);
+    if (req.user.role === "ADMIN"){
+      for (const c of data){
+        if (c.lead?.phoneEncrypted){
+          try { c.lead.phone = decrypt(c.lead.phoneEncrypted); } catch {}
+          delete c.lead.phoneEncrypted;
+        }
+      }
+    } else {
+      for (const c of data){
+        if (assistedSet.has(c.id)){
+          // Marca janela como assistida + libera telefone real
+          c._isAssistView = true;
+          if (c.lead?.phoneEncrypted){
+            try { c.lead.phone = decrypt(c.lead.phoneEncrypted); } catch {}
+          }
+        } else if (phoneAllowed(req.user.id) && c.lead?.phoneEncrypted){
+          // 2026-06-07 · allowlist (Cidral) · libera telefone real dos leads deles
+          try { c.lead.phone = decrypt(c.lead.phoneEncrypted); } catch {}
+        }
+        if (c.lead) delete c.lead.phoneEncrypted;
+      }
+      // Anexa metadados do pedido de assistência (tipo + justificativa + quem pediu)
+      // pra cada conv assistida · frontend usa pra montar o banner.
+      if (assistedSet.size > 0){
+        const assistRows = await db.conversationAssist.findMany({
+          where: { conversationId: { in: assistedConvIds }, assistantUserId: req.user.id, status: "PENDING" },
+          orderBy: { createdAt: "desc" },
+          include: { requestedBy: { select: { id: true, name: true, email: true } } }
+        });
+        const assistByConv = new Map();
+        for (const a of assistRows){
+          // Pega o mais recente PENDING por conv (já ordenado DESC)
+          if (!assistByConv.has(a.conversationId)) assistByConv.set(a.conversationId, a);
+        }
+        for (const c of data){
+          if (assistedSet.has(c.id)){
+            const a = assistByConv.get(c.id);
+            if (a){
+              c._assistInfo = {
+                id: a.id,
+                type: a.type,
+                justification: a.justification,
+                requestedAt: a.createdAt,
+                requestedByName: a.requestedBy.name,
+                requestedByEmail: a.requestedBy.email
+              };
+            }
+          }
+        }
+      }
+    }
+    // 2026-05-20 · Removido o `convs: data.map(...)` que despejava até 10k objetos
+    // estruturados no log a cada GET /api/conversations. Mantém só userId+count
+    // que basta pra auditoria. Pra debug ad-hoc, setar LOG_LEVEL=debug e usar
+    // a linha logger.debug abaixo.
+    logger.info({
+      userId: req.user.id, email: req.user.email, role: req.user.role, filter: filterDesc,
+      count: data.length, take: _take, hasCursor: !!_cursor, nextCursor: nextCursor ? "yes" : "no"
+    }, "🔍 conv_list");
+    if (logger.level === "debug"){
+      logger.debug({
+        convs: data.slice(0, 50).map(c => ({ id: c.id, assocId: c.associateId, owner: c.associate?.user?.name, leadName: c.lead?.name }))
+      }, "🔍 conv_list · sample 50");
+    }
+    // 2026-06-05 · unread estilo WhatsApp Web · qtd de mensagens INBOUND do cliente
+    // ainda SEM resposta (createdAt > ultimo outbound da conversa). 1 query p/ todas.
+    try {
+      const _ids = data.map((c) => c.id);
+      if (req.query.unread === "1" && _ids.length){
+        const _ph = _ids.map((_, i) => `$${i + 1}`).join(",");
+        const _rows = await db.$queryRawUnsafe(
+          `SELECT m."conversationId" AS cid, COUNT(*)::int AS n
+             FROM "Message" m
+            WHERE m."conversationId" IN (${_ph})
+              AND m.direction = 'inbound'
+              AND m."createdAt" > COALESCE(
+                    (SELECT MAX(o."createdAt") FROM "Message" o
+                      WHERE o."conversationId" = m."conversationId" AND o.direction = 'outbound'),
+                    '-infinity'::timestamp)
+            GROUP BY m."conversationId"`,
+          ..._ids
+        );
+        const _um = new Map(_rows.map((r) => [r.cid, Number(r.n)]));
+        for (const c of data) c.unread = _um.get(c.id) || 0;
+      }
+    } catch (e){ logger.warn({ err: e.message }, "unread calc falhou (segue sem badge)"); }
+    res.json({ data, nextCursor, take: _take });
+  } catch (e){ next(e); }
+});
+
+// GET /api/conversations/:id/messages
+r.get("/:id/messages", requireAuth, async (req, res, next) => {
+  try {
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id } });
+    if (!conv) return res.status(404).json({ error: "not_found" });
+
+    // Permissão · ADMIN, dono ou ASSISTENTE ATIVO (F1 Éder).
+    let isAssist = false;
+    let assistRecord = null;
+    if (req.user.role !== "ADMIN"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id){
+        assistRecord = await findActiveAssistForUser({ conversationId: conv.id, userId: req.user.id });
+        if (!assistRecord) return res.status(403).json({ error: "forbidden" });
+        isAssist = true;
+      }
+    }
+    const allMessages = await db.message.findMany({ where: { conversationId: conv.id, hiddenAt: null }, orderBy: { createdAt: "asc" } });
+    // Esconde mensagens de "atividade" da VAI (start/close de atendimento) que
+    // possam ter sido persistidas antes do filtro do webhook/sync-vai.
+    const messages = allMessages.filter(m => !isVaiActivity({ type: m.contentType, content: m.text }));
+    const lead = await db.lead.findUnique({ where: { id: conv.leadId } });
+    // 2026-06-07 · Corte de historico na transferencia (VISIBILIDADE, sem delecao):
+    // o corretor que recebeu o lead via transferencia NAO ve mensagens anteriores a ela.
+    // ADMIN/LEGAL veem tudo. Fonte = RedistributionLog (auto + manual). Reversivel:
+    // HIDE_PRE_TRANSFER_HISTORY=0 desliga.
+    const _seesFull = req.user.role === "ADMIN" || req.user.role === "LEGAL";
+    let visibleMessages = messages;
+    if (process.env.HIDE_PRE_TRANSFER_HISTORY !== "0" && !_seesFull && conv.associateId){
+      try {
+        // 2026-06-11 (fix) · Corte SOMENTE quando houve redistribuição real (redistributionCount > 0).
+        // O assignedAt sem redistribuição pode ser a data da atribuição original com histórico
+        // importado do VAI CRM — esses msgs ficam antes do assignedAt e NÃO devem ser ocultados.
+        if (lead && lead.redistributionCount && lead.redistributionCount > 0 && lead.assignedAt){
+          const _cut = new Date(lead.assignedAt).getTime();
+          if (Number.isFinite(_cut) && _cut > 0){
+            visibleMessages = messages.filter(m => {
+              const t = m.createdAt ? new Date(m.createdAt).getTime() : 0;
+              return t >= _cut;
+            });
+          }
+        }
+      } catch (e){ /* fail-open: em erro mostra tudo */ }
+    }
+    // 2026-05-25 · Assistente (F1 Éder) vê telefone real porque foi explicitamente
+    // convidado pelo corretor parceiro a olhar a conversa.
+    const canSeeRealPhone = req.user.role === "ADMIN" || isAssist || phoneAllowed(req.user.id); // 2026-06-08 · SO admin/assistente/Cidral (sem manualFree/phoneReleased)
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    // Janela 24h (Meta) · backend AUTORITATIVO: calcula de lastInboundFrom(messages) ?? coluna.
+    const _win = windowState(lastInboundFrom(allMessages) || conv.lastInboundAt);
+    const out = {
+      conversation: { ...conv, windowOpen: _win.windowOpen, requiresTemplate: _win.requiresTemplate, lastInboundAt: _win.lastInboundAt, windowExpiresAt: _win.windowExpiresAt },
+      lead: { id: lead.id, name: lead.name, phoneMasked: lead.phoneMasked, ...(canSeeRealPhone ? { phone: decrypt(lead.phoneEncrypted) } : {}) },
+      messages: visibleMessages
+    };
+
+    // 2026-06-04 · Anexa info de reatribuição (RedistributionLog) pra UI mostrar
+    // banner "Conversa veio do corretor X em DD/MM" — resolve a confusão do corretor
+    // novo lendo template com nome do corretor anterior (ex: "Me chamo Jonniver…"
+    // sendo lido por José Roberto). Só inclui quando lead.redistributionCount > 0.
+    if (_seesFull && lead.redistributionCount && lead.redistributionCount > 0){
+      try {
+        const lastLog = await db.redistributionLog.findFirst({
+          where: { leadId: lead.id },
+          orderBy: { timestamp: "desc" }
+        });
+        if (lastLog?.previousAssociateId){
+          const prev = await db.associate.findUnique({
+            where: { id: lastLog.previousAssociateId },
+            select: { user: { select: { name: true } } }
+          });
+          out._redistribution = {
+            count: lead.redistributionCount,
+            previousAssociateName: prev?.user?.name || null,
+            redistributedAt: lastLog.timestamp,
+            reason: lastLog.reason || null
+          };
+        }
+      } catch (e){
+        logger.warn?.({ err: e.message, leadId: lead.id }, "redistribution_lookup_failed · banner ausente, não-fatal");
+      }
+    }
+
+    if (isAssist && assistRecord){
+      // Carrega quem pediu pra montar banner no frontend
+      const requester = await db.user.findUnique({
+        where: { id: assistRecord.requestedById },
+        select: { id: true, name: true, email: true }
+      });
+      out._assistView = {
+        id: assistRecord.id,
+        type: assistRecord.type,
+        justification: assistRecord.justification,
+        requestedAt: assistRecord.createdAt,
+        requestedByName: requester?.name || null,
+        requestedByEmail: requester?.email || null,
+        readOnly: true
+      };
+    }
+    res.json(out);
+  } catch (e){ next(e); }
+});
+
+// POST /api/conversations/:id/sync-vai · safety net pra webhook inbound da VAI
+// que falhou (WhatsApp Web 1ª resposta nao dispara webhook em alguns chats).
+// Puxa as ultimas mensagens do chat na VAI, persiste as inbound novas e emite
+// SSE message.inbound (mesmo evento do webhook · frontend ja trata).
+r.post("/:id/sync-vai", requireAuth, async (req, res, next) => {
+  try {
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id } });
+    if (!conv) return res.status(404).json({ error: "not_found" });
+    if (req.user.role !== "ADMIN"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id) return res.status(403).json({ error: "forbidden" });
+    }
+    if (!conv.vaiConvId) return res.json({ added: 0, reason: "no_vai_chat" });
+
+    let result;
+    try { result = await vaiListChatMessages(conv.vaiConvId, { limit: "50" }); }
+    catch (e){
+      logger.warn({ err: e.message, convId: conv.id, vaiChatId: conv.vaiConvId }, "sync-vai · listChatMessages falhou");
+      return res.status(502).json({ error: "vai_unavailable", message: e.message });
+    }
+    // Parsing tolerante a varios shapes da VAI (.data, .messages, .items, ou array direto)
+    const arr = Array.isArray(result) ? result
+      : (result?.data || result?.messages || result?.items || []);
+
+    // Diagnostico · ajuda a identificar quando VAI muda contrato
+    if (arr.length > 0 && !arr[0]?.id){
+      logger.warn({ convId: conv.id, vaiChatId: conv.vaiConvId, firstKeys: Object.keys(arr[0] || {}), resultKeys: Object.keys(result || {}) }, "sync-vai · primeiro item sem 'id' · shape inesperado");
+    }
+
+    const associate = await db.associate.findUnique({
+      where: { id: conv.associateId },
+      select: { userId: true, user: { select: { email: true, name: true, role: true } } }
+    });
+
+    let added = 0;
+    let candidatesSeen = 0; // mensagens que passaram pelo filtro inbound
+    let dedupSkips = 0;     // candidatas ja existentes em db.message
+    const created = [];
+    for (const m of arr){
+      if (!m) continue;
+      // Detectar inbound de forma tolerante · VAI as vezes nao popula 'isFromContact'
+      // mas sempre popula 'isOwn' (false=do contato). Aceita varios sinais.
+      const isInbound = (m.isFromContact === true)
+                     || (m.isOwn === false)
+                     || (m.direction === "inbound")
+                     || (m.fromRole === "lead");
+      if (!isInbound) continue;
+      candidatesSeen++;
+      if (!m.id) continue;
+      // Skip VAI activity (start/close atendimento) · nao gravar como mensagem
+      if (isVaiActivity({ type: m.type, content: m.content })) continue;
+      const exists = await db.message.findFirst({ where: { vaiMessageId: String(m.id) }, select: { id: true } });
+      if (exists){ dedupSkips++; continue; }
+      const text = String(m.content || "");
+      const contentType = m.type || "text";
+      const fileUrl = m.fileUrl || null;
+      const mimeType = m.mimeType || null;
+      const deliveredAt = m.deliveredAt ? new Date(m.deliveredAt) : (m.createdAt ? new Date(m.createdAt) : new Date());
+      const row = await db.message.create({
+        data: {
+          conversationId: conv.id,
+          direction: "inbound",
+          fromRole: "lead",
+          text,
+          contentType,
+          ...(fileUrl  ? { fileUrl }  : {}),
+          ...(mimeType ? { mimeType } : {}),
+          vaiMessageId: String(m.id),
+          deliveredAt
+        }
+      });
+      chatInsertMessage({
+        conversationId: conv.id,
+        direction: "inbound",
+        fromRole: "lead",
+        content: text,
+        contentType,
+        fileUrl,
+        vaiMessageId: String(m.id),
+        metadata: m,
+        deliveredAt
+      });
+      created.push({ id: row.id, vaiMessageId: m.id, text, contentType, fileUrl, mimeType, at: deliveredAt });
+      added++;
+    }
+
+    if (added > 0){
+      await db.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: new Date() } });
+      const ownerIds = associate?.userId ? [associate.userId] : [];
+      for (const nm of created){
+        sseToMany(ownerIds, "message.inbound", {
+          conversationId: conv.id,
+          leadId: conv.leadId,
+          text: nm.text,
+          contentType: nm.contentType,
+          fileUrl: nm.fileUrl,
+          mimeType: nm.mimeType,
+          vaiMessageId: nm.vaiMessageId,
+          at: (nm.at?.toISOString?.() || new Date().toISOString()),
+          source: "manual_sync"
+        });
+      }
+      logger.info({ convId: conv.id, vaiChatId: conv.vaiConvId, added, by: req.user.email }, "🔄 sync-vai · mensagens reconciliadas");
+    } else {
+      // Diagnostico: nao adicionamos nada · ajuda a achar bug de filtro/dedup
+      logger.info({
+        convId: conv.id, vaiChatId: conv.vaiConvId, total: arr.length,
+        candidatesSeen, dedupSkips,
+        sampleFields: arr[0] ? { id: !!arr[0].id, isFromContact: arr[0].isFromContact, isOwn: arr[0].isOwn, direction: arr[0].direction, hasContent: !!arr[0].content } : null
+      }, "  ↳ sync-vai · 0 mensagens novas (diagnostico)");
+    }
+
+    res.json({ added, total: arr.length, candidatesSeen, dedupSkips });
+  } catch (e){ next(e); }
+});
+
+
+// POST /api/conversations/:id/accept · 2026-06-03 · chat novo (restaurada 2026-06-05)
+// Corretor ACEITA o lead (Pendente → Atendendo). Libera as ações no chat novo.
+// Idempotente. Marca firstContactAt também (impede redistribuição do lead aceito).
+r.post("/:id/accept", requireAuth, async (req, res, next) => {
+  try {
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id } });
+    if (!conv) return res.status(404).json({ error: "not_found" });
+    if (req.user.role !== "ADMIN"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id) return res.status(403).json({ error: "forbidden" });
+    }
+    if (!conv.accepted){
+      await db.conversation.update({ where: { id: conv.id }, data: { accepted: true, acceptedAt: new Date() } });
+      // impede redistribuição do lead aceito · só marca firstContactAt se ainda não houver
+      const lead = await db.lead.findUnique({ where: { id: conv.leadId }, select: { firstContactAt: true } });
+      if (lead && !lead.firstContactAt){
+        await db.lead.update({ where: { id: conv.leadId }, data: { firstContactAt: new Date() } });
+      }
+      await audit({ req, action: "CONVERSATION_ACCEPTED", entity: `Conversation:${conv.id}`, metadata: { leadId: conv.leadId } });
+    }
+    res.json({ ok: true, accepted: true, acceptedAt: conv.acceptedAt || new Date() });
+  } catch (e){ next(e); }
+});
+
+// POST /api/conversations/:id/pin · 2026-06-13 · Fixar/desafixar conversa no topo (estilo WhatsApp).
+// Body: { pinned: boolean }. Só o dono (ou admin). Máx 5 fixadas por corretor.
+r.post("/:id/pin", requireAuth, async (req, res, next) => {
+  try {
+    const pinned = req.body?.pinned === true || req.body?.pinned === "true";
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id }, select: { id: true, associateId: true, pinned: true } });
+    if (!conv) return res.status(404).json({ error: "not_found" });
+    if (req.user.role !== "ADMIN"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id) return res.status(403).json({ error: "forbidden" });
+    }
+    // Trava de 5: só conta ao FIXAR uma nova (desafixar sempre pode).
+    if (pinned && !conv.pinned){
+      const count = await db.conversation.count({ where: { associateId: conv.associateId, pinned: true } });
+      if (count >= 5) return res.status(409).json({ error: "max_pins", message: "Máximo de 5 conversas fixadas. Desafixe uma para fixar outra." });
+    }
+    await db.conversation.update({ where: { id: conv.id }, data: { pinned, pinnedAt: pinned ? new Date() : null } });
+    res.json({ ok: true, pinned, pinnedAt: pinned ? new Date().toISOString() : null });
+  } catch (e){ next(e); }
+});
+
+// POST /api/conversations/:id/messages
+const msgSchema = z.object({ text: z.string().min(1).max(4000) });
+r.post("/:id/messages", requireAuth, async (req, res, next) => {
+  try {
+    // 2026-05-07 · trace ASCII puro p/ rastrear envio outbound CRM->VAI
+    logger.info({ trace: "MSG_OUT_TRACE", step: "route_enter", convId: req.params.id, sender: req.user.email }, "MSG_OUT_TRACE step=route_enter");
+    const { text } = msgSchema.parse(req.body);
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id }, include: { lead: true } });
+    if (!conv) {
+      logger.warn({ trace: "MSG_OUT_TRACE", step: "conv_not_found", convId: req.params.id }, "MSG_OUT_TRACE step=conv_not_found");
+      return res.status(404).json({ error: "not_found" });
+    }
+    // 2026-05-25 · F1 Éder (v1 read-only) → 2026-05-27 · F1 Éder v2 ACESSO TOTAL
+    //   Corretor parceiro pede ajuda → Éder ENTRA na conversa e responde direto
+    //   pro lead. Lead segue na carteira do corretor original (sem mudança em
+    //   Lead.assignedToId nem Conversation.associateId), mas o ENVIO via Éder
+    //   passa pelo mesmo fluxo VAI/Cloud da Conversation. Audit log marca quem
+    //   enviou pra rastreabilidade.
+    let _senderRole = "owner";   // "owner" (corretor dono) | "assistant" (Éder) | "admin"
+    let _activeAssist = null;
+    if (req.user.role === "ADMIN"){
+      _senderRole = "admin";
+    } else {
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id){
+        // Não é o dono · ver se é assistente ativo (F1 Éder)
+        _activeAssist = await findActiveAssistForUser({ conversationId: conv.id, userId: req.user.id });
+        if (!_activeAssist) return res.status(403).json({ error: "forbidden" });
+        _senderRole = "assistant";
+        logger.info({
+          flow: "assist_send", convId: conv.id, leadId: conv.leadId,
+          assistantUserId: req.user.id, assistantName: req.user.name,
+          ownerAssociateId: conv.associateId, assistId: _activeAssist.id, type: _activeAssist.type
+        }, "💼 ASSIST · Éder respondendo direto pelo corretor parceiro");
+      }
+    }
+    // Indicador crítico: chat só entrega WhatsApp se teve binding inbound prévio.
+    // (memória: vai_whatsapp_binding_rule.md · chat criado programaticamente não chega)
+    // Bloqueio blacklist: lead pausado/bloqueado por qualidade ou número inativo
+    if (conv.lead && conv.lead.noWhatsApp) {
+      const reason = conv.lead.blacklistReason ?? '';
+      let msg, errCode;
+      if (reason === 'invalid_number') {
+        msg = 'Número inativo ou inexistente no WhatsApp.';
+        errCode = 'lead_invalid_number';
+      } else if (reason === 'opted_out') {
+        msg = 'Lead optou por não receber mensagens de marketing.';
+        errCode = 'lead_opted_out';
+      } else if (reason.startsWith('131049_temp')) {
+        const dias = reason === '131049_temp_3d' ? 3 : 7;
+        msg = 'Lead em pausa por qualidade WhatsApp. Aguarde ' + dias + ' dias.';
+        errCode = 'lead_blacklisted_131049';
+      } else {
+        msg = 'Envio bloqueado para este lead.';
+        errCode = 'lead_blocked';
+      }
+      logger.warn({ convId: conv.id, leadId: conv.leadId, reason }, 'OUTBOUND bloqueado (blacklist)');
+      return res.status(422).json({ error: errCode, message: msg });
+    }
+    const inboundCount = await db.message.count({
+      where: { conversationId: conv.id, direction: "inbound" }
+    });
+    const hasInboundBinding = inboundCount > 0;
+    logger.info({
+      flow: "chat_outbound", convId: conv.id, leadId: conv.leadId, leadName: conv.lead.name,
+      sender: req.user.email,
+      vaiChatId: conv.vaiConvId, vaiContactId: conv.vaiContactId, vaiLid: conv.vaiLid, vaiPhone: conv.vaiPhone,
+      hasInboundBinding, inboundCount,
+      preview: text.slice(0,60), textLen: text.length
+    }, "📤 OUTBOUND · corretor enviou mensagem");
+    if (!hasInboundBinding) {
+      // Janela 24h fechada: lead nunca respondeu, Meta bloqueia mensagem livre
+      // Corretor deve usar template de reabordagem (HSM)
+      logger.warn({ convId: conv.id, leadId: conv.leadId, leadName: conv.lead.name }, 'OUTBOUND bloqueado janela_24h_fechada');
+      await db.message.create({
+        data: { conversationId: conv.id, fromRole: 'associate', text,
+                messageStatus: 'failed', failedAt: new Date(),
+                errorReason: 'janela_24h_fechada' }
+      }).catch(() => {});
+      return res.status(422).json({
+        error: 'janela_24h_fechada',
+        message: 'O cliente ainda não respondeu. Envie um template de reabordagem para reabrir a conversa.'
+      });
+    }
+    const msg = await db.message.create({
+      data: { conversationId: conv.id, direction: "outbound", fromRole: "associate", text, deliveredAt: new Date() }
+    });
+
+    // Marca firstContactAt (impede redistribuição)
+    if (!conv.lead.firstContactAt){
+      await db.lead.update({ where: { id: conv.leadId }, data: { firstContactAt: new Date() } });
+      await audit({ req, action: "LEAD_FIRST_CONTACT", entity: `Lead:${conv.leadId}`, metadata: { conversationId: conv.id, senderRole: _senderRole } });
+    }
+    // 2026-05-27 · F1 Éder · audit do envio pelo assistente (rastreabilidade)
+    if (_senderRole === "assistant" && _activeAssist){
+      await audit({
+        req,
+        action: "ASSIST_MESSAGE_SENT",
+        entity: `Message:${msg.id}`,
+        metadata: {
+          conversationId: conv.id,
+          leadId: conv.leadId,
+          assistId: _activeAssist.id,
+          assistType: _activeAssist.type,
+          ownerAssociateId: conv.associateId,
+          preview: String(text).slice(0, 80)
+        }
+      }).catch(() => {});
+    }
+    await db.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: new Date() } });
+    // Atualiza lastActiveAt do associate
+    if (req.user.role === "ASSOCIATE"){
+      await db.associate.updateMany({ where: { userId: req.user.id }, data: { lastActiveAt: new Date() } });
+    }
+
+    // Envia via Meta Cloud (PRIMARIO · 2026-05-13) com fallback VAI.
+    // Why: sessao VAI estava caindo (424 msgs sem entrega em 24h). Cloud
+    // entrega de forma confiavel dentro da janela 24h apos resposta do lead.
+    (async () => {
+      // -------- PRIMARIO · Meta Cloud sendText --------
+      try {
+        if (cloudEnabled()){
+          let phoneCloud = null;
+          try { phoneCloud = decrypt(conv.lead.phoneEncrypted); } catch {}
+          const phoneDigits = phoneCloud ? String(phoneCloud).replace(/\D/g, "") : null;
+          if (phoneDigits){
+            logger.info({ trace: "MSG_OUT_TRACE", step: "cloud_attempt", convId: conv.id, hasInboundBinding, leadName: conv.lead.name }, "MSG_OUT_TRACE step=cloud_attempt");
+            const cloudR = await cloudSendText({ to: phoneDigits, text, phoneNumberId: conv.inboundPhoneId });
+            if (cloudR.ok){
+              try {
+                await db.message.update({
+                  where: { id: msg.id },
+                  data: {
+                    provider: "whatsapp_cloud",
+                    messageStatus: "sent",
+                    whatsappMessageId: cloudR.messageId || null
+                  }
+                });
+              } catch (eUpd){
+                logger.warn({ convId: conv.id, err: eUpd.message }, "  ↳ warn · falha ao persistir provider/messageId no msg outbound (cloud)");
+              }
+              logger.info({
+                trace: "MSG_OUT_TRACE", step: "cloud_sent",
+                convId: conv.id, leadId: conv.leadId, leadName: conv.lead.name,
+                msgId: msg.id, waMsgId: cloudR.messageId
+              }, "✅ OUTBOUND · enviado via Meta Cloud · webhook trara delivered/read");
+              return; // Sucesso · NAO cai para VAI
+            }
+            if (cloudR.reengagement || cloudR.code === 131047 || cloudR.code === 131026 || cloudR.code === 131049){
+              const errReason = cloudR.code === 131049 ? (cloudR.error ?? '131049:quality_block') : "reengagement_required_24h_window_closed";
+              try {
+                await db.message.update({
+                  where: { id: msg.id },
+                  data: {
+                    provider: "whatsapp_cloud",
+                    messageStatus: "failed",
+                    failedAt: new Date(),
+                    errorReason: errReason
+                  }
+                });
+              } catch (eUpd){ logger.warn({ convId: conv.id, err: eUpd.message }, "  ↳ warn · falha ao marcar msg como failed"); }
+              if (cloudR.code === 131049) {
+                logger.warn({ convId: conv.id, leadId: conv.leadId, leadName: conv.lead.name }, "❌ OUTBOUND · 131049 · qualidade bloqueada pelo Meta · blacklist marcará na próxima rodada");
+              } else {
+                logger.warn({ convId: conv.id, leadName: conv.lead.name, code: cloudR.code }, "❌ OUTBOUND · janela 24h fechada");
+              }
+              return; // NAO cai para VAI
+            }
+            // Cloud retornou outro erro · cai para VAI como fallback
+            logger.warn({
+              trace: "MSG_OUT_TRACE", step: "cloud_other_error",
+              convId: conv.id, code: cloudR.code, status: cloudR.status, err: cloudR.error
+            }, "⚠ OUTBOUND · Cloud retornou erro inesperado · fallback VAI");
+          } else {
+            logger.warn({ convId: conv.id }, "⚠ OUTBOUND · sem phone decifravel · pulando Cloud · tentando VAI");
+          }
+        } else {
+          logger.info({ convId: conv.id }, "OUTBOUND · whatsapp_cloud desabilitado · usando VAI direto");
+        }
+      } catch (eCloud){
+        logger.error({ err: eCloud.message, convId: conv.id, leadId: conv.leadId }, "💥 OUTBOUND · excecao no Cloud · fallback VAI");
+      }
+
+      // -------- FALLBACK · VAI (legado) --------
+      try {
+        // Onboard só se NÃO tivermos NEM chatId NEM contactId · se tiver contactId
+        // (veio do webhook inbound), usa ele pra garantir que a msg vai pro contato REAL
+        if (!conv.vaiConvId && !conv.vaiContactId){
+          const phoneReal = decrypt(conv.lead.phoneEncrypted);
+          logger.info({ convId: conv.id, phone: phoneReal }, "  ↳ onboarding na VAI (sem ids prévios)");
+          const onboard = await vaiOnboardLeadSafe({
+            name: conv.lead.name,
+            phone: phoneReal,
+            externalId: conv.lead.id,
+            customFields: { segmento: conv.lead.segment }
+          });
+          if (onboard.ok){
+            await db.conversation.update({
+              where: { id: conv.id },
+              data: {
+                ...(onboard.chatId    ? { vaiConvId:    onboard.chatId }    : {}),
+                ...(onboard.contactId ? { vaiContactId: onboard.contactId } : {}),
+                ...(onboard.lid       ? { vaiLid:       onboard.lid }       : {}),
+                ...(onboard.phone     ? { vaiPhone:     onboard.phone }     : {})
+              }
+            });
+            conv.vaiConvId    = onboard.chatId    || conv.vaiConvId;
+            conv.vaiContactId = onboard.contactId || conv.vaiContactId;
+            logger.info({ chatId: onboard.chatId, contactId: onboard.contactId }, "  ↳ onboard OK");
+          } else {
+            logger.warn({ err: onboard.error }, "  ↳ onboard FAIL");
+          }
+        }
+        // 2026-05-06 · Envia (estratégia condicional · v2 EXPANDIDA):
+        // Validação empírica (logs 20:14): MESMO chats criados por vaiOnboardLeadSafe
+        // (cold outbound) caem no mesmo bug "VAI aceita mas não despacha". O bug não é
+        // exclusivo de chats inbound — afeta TODO chat existente. O ÚNICO caminho que
+        // entrega é o do script vai_crm_teste.py: close-all + create-fresh + send.
+        //
+        // Por isso: SEMPRE usa OUTBOUND-FRESH quando temos contactId. A overhead de
+        // 2-3 API calls extras a mais é aceitável pra garantir entrega.
+        //
+        // Quando NÃO temos contactId (caso muito raro · onboard falhou): fallback ao
+        // vaiSendSafe legado, que pode tentar criar via ensureChat ou retornar erro.
+        // Se o OUTBOUND-FRESH falhar (rede / 5xx), também faz fallback pro vaiSendSafe.
+        const tSend = Date.now();
+        logger.info({ trace: "MSG_OUT_TRACE", step: "before_send", convId: conv.id, chatId: conv.vaiConvId, contactId: conv.vaiContactId, hasInboundBinding }, "MSG_OUT_TRACE step=before_send");
+        logger.info({ convId: conv.id, chatId: conv.vaiConvId, contactId: conv.vaiContactId, hasInboundBinding }, "  ↳ enviando via VAI...");
+        let r;
+        if (conv.vaiContactId){
+          // 2026-05-07 · Reuse de chat fresco recente (TTL 10min). 1ª msg cria chat
+          // via vaiSendOutboundFresh; 2ª-Nª reusam o chat criado. Sem isso, cada
+          // msg fechava chat anterior e criava novo, levando WhatsApp/VAI a perder
+          // sessão e mensagens 2+ não despachavam.
+          const reuse = _getFreshReuse(conv.id);
+          if (reuse && reuse.vaiConvId){
+            logger.info({ trace: "MSG_OUT_TRACE", step: "path_chosen", path: "reuse", convId: conv.id, vaiConvId: reuse.vaiConvId, ageMs: Date.now() - reuse.lastSuccessAt }, "MSG_OUT_TRACE step=path_chosen path=reuse");
+            try {
+              const sent = await vaiSendChatMessage(reuse.vaiConvId, { content: text, type: "text" });
+              r = { ok: true, data: sent, chatId: reuse.vaiConvId, recovered: false };
+              _setFreshReuse(conv.id, reuse.vaiConvId);
+              logger.info({ trace: "MSG_OUT_TRACE", step: "reuse_result", convId: conv.id, ok: true, msgId: sent?.id || null, msgStatus: sent?.status || null }, "MSG_OUT_TRACE step=reuse_result ok=true");
+            } catch (eReuse){
+              logger.warn({ trace: "MSG_OUT_TRACE", step: "reuse_failed", convId: conv.id, err: eReuse.message, status: eReuse.status }, "MSG_OUT_TRACE step=reuse_failed · fallback p/ fresh");
+              _freshChatReuseCache.delete(conv.id);
+              r = await vaiSendOutboundFresh({ contactId: conv.vaiContactId, text });
+              logger.info({ trace: "MSG_OUT_TRACE", step: "fresh_result", convId: conv.id, ok: r?.ok, error: r?.error || r?.reason || null, status: r?.status || null, chatIdUsed: r?.chatId || null, msgId: r?.data?.id || null, msgStatus: r?.data?.status || null }, "MSG_OUT_TRACE step=fresh_result");
+              if (r.ok && r.chatId) _setFreshReuse(conv.id, r.chatId);
+            }
+          } else {
+            logger.info({ trace: "MSG_OUT_TRACE", step: "path_chosen", path: "fresh", convId: conv.id, contactId: conv.vaiContactId, hasInboundBinding }, "MSG_OUT_TRACE step=path_chosen path=fresh");
+            logger.info({ convId: conv.id, contactId: conv.vaiContactId, hasInboundBinding }, "  ↳ usando fluxo OUTBOUND-FRESH (close-all + create + send)");
+            r = await vaiSendOutboundFresh({ contactId: conv.vaiContactId, text });
+            logger.info({ trace: "MSG_OUT_TRACE", step: "fresh_result", convId: conv.id, ok: r?.ok, error: r?.error || r?.reason || null, status: r?.status || null, chatIdUsed: r?.chatId || null, msgId: r?.data?.id || null, msgStatus: r?.data?.status || null }, "MSG_OUT_TRACE step=fresh_result");
+            if (r.ok && r.chatId) _setFreshReuse(conv.id, r.chatId);
+          }
+          if (!r.ok){
+            logger.warn({ convId: conv.id, fresh_error: r.error || r.reason, status: r.status }, "  ↳ outbound-fresh falhou · fallback p/ vaiSendSafe");
+            r = await vaiSendSafe({ text, chatId: conv.vaiConvId, contactId: conv.vaiContactId });
+            logger.info({ trace: "MSG_OUT_TRACE", step: "safe_fallback_result", convId: conv.id, ok: r?.ok, error: r?.error || null, status: r?.status || null }, "MSG_OUT_TRACE step=safe_fallback_result");
+          }
+        } else {
+          // Sem contactId · raro (onboard falhou ou ainda não rodou) · usa caminho legado
+          logger.info({ trace: "MSG_OUT_TRACE", step: "path_chosen", path: "safe", convId: conv.id, hasInboundBinding }, "MSG_OUT_TRACE step=path_chosen path=safe");
+          r = await vaiSendSafe({ text, chatId: conv.vaiConvId, contactId: conv.vaiContactId });
+          logger.info({ trace: "MSG_OUT_TRACE", step: "safe_result", convId: conv.id, ok: r?.ok, error: r?.error || null, status: r?.status || null }, "MSG_OUT_TRACE step=safe_result");
+        }
+        const sendMs = Date.now() - tSend;
+        if (r.ok){
+          // Log COMPLETO da resposta VAI · status:"sent" só prova que VAI aceitou,
+          // não que WhatsApp entregou. (memória: vai_whatsapp_ack_levels.md)
+          logger.info({
+            convId: conv.id,
+            chatIdUsado: r.chatId, recovered: r.recovered || false,
+            msgId: r.data?.id,
+            status: r.data?.status,
+            ack: r.data?.ack ?? null,
+            deliveredAt: r.data?.deliveredAt ?? null,
+            readAt: r.data?.readAt ?? null,
+            createdAt: r.data?.createdAt ?? null,
+            rawKeys: r.data ? Object.keys(r.data) : [],
+            sendMs
+          }, "  ↳ ✅ VAI aceitou (status:sent ≠ entregue · vai checar delivery em 8s)");
+
+          // Persiste vaiMessageId no banco · fecha o gap raiz que causou o bug do
+          // bootstrap (caso Guilherme Gregório · 2026-04-28). Sem isso, msgs
+          // outbound ficam sem vaiMessageId e dedup por (vaiMessageId not null)
+          // no chatHistoryBootstrap nao enxergaria as originais, permitindo
+          // re-import invertido. Tambem fortalece dedup do webhook echo.
+          if (r.data?.id){
+            try {
+              await db.message.update({
+                where: { id: msg.id },
+                data: { vaiMessageId: String(r.data.id) }
+              });
+            } catch (eUpd){
+              logger.warn({ convId: conv.id, msgId: msg.id, err: eUpd.message }, "  ↳ warn · falha ao persistir vaiMessageId no msg outbound");
+            }
+          }
+
+          if (r.chatId && r.chatId !== conv.vaiConvId){
+            await db.conversation.update({ where: { id: conv.id }, data: { vaiConvId: r.chatId } });
+            logger.info({ convId: conv.id, oldChatId: conv.vaiConvId, newChatId: r.chatId }, "  ↳ vaiConvId atualizado (recover)");
+          }
+
+          // Checagem de delivery real + auto-heal seguindo doc validada
+          // (memórias: vai_outbound_padrao.md · vai_whatsapp_ack_levels.md)
+          //
+          // Por que 30s e não 8s: o polling worker faz rajada de 5-6 chats simultâneos
+          // a cada ~30s, estourando rate-limit (429). Em 8s tem alta chance de bater
+          // num 429. Em 30s caímos numa janela mais frouxa.
+          //
+          // Auto-heal: se delivery_check confirma deliveredAt:null + temos vaiContactId
+          // + nunca healamos esta conv → recria chat seguindo POST /chats { contactId,
+          // channelId, category:"pendente" } e reenvia. Esse é o fluxo validado em
+          // 2026-04-21 que entrega `delivered`. Limita a 1 heal por conv por vida do
+          // processo pra evitar loop quando WhatsApp da VAI estiver realmente caído.
+          const finalChatId = r.chatId || conv.vaiConvId;
+          const finalMsgId  = r.data?.id;
+          if (finalChatId && finalMsgId){
+            setTimeout(async () => {
+              let m = null;
+              try {
+                const list = await vaiListChatMessages(finalChatId, { limit: "30" });
+                const arr = Array.isArray(list) ? list : (list?.data || []);
+                m = arr.find(x => x.id === finalMsgId);
+                if (!m){
+                  logger.warn({ convId: conv.id, chatId: finalChatId, msgId: finalMsgId }, "  ↳ 🔎 delivery_check · msg NÃO está mais na lista da VAI (sumiu?)");
+                  return;
+                }
+                const delivered = Boolean(m.deliveredAt || m.ack >= 2 || m.status === "delivered" || m.status === "read");
+                const read = Boolean(m.readAt || m.ack >= 3 || m.status === "read");
+                logger.info({
+                  convId: conv.id, chatId: finalChatId, msgId: finalMsgId,
+                  status: m.status, ack: m.ack ?? null,
+                  deliveredAt: m.deliveredAt ?? null, readAt: m.readAt ?? null,
+                  delivered, read,
+                  hasInboundBinding,
+                  diagnosis: !delivered && !hasInboundBinding
+                    ? "❌ NÃO ENTREGUE · chat sem binding inbound (whatsapp Web não despacha)"
+                    : !delivered
+                    ? "❌ NÃO ENTREGUE · chat tem binding mas VAI não conseguiu despachar"
+                    : read ? "✅ LIDA" : "✅ ENTREGUE"
+                }, "  ↳ 🔎 delivery_check (30s)");
+
+                // Auto-heal · só se: NÃO entregou + temos contactId + nunca healed nesta vida
+                if (!delivered && conv.vaiContactId && !_hasAutoHealed(conv.id)){
+                  _autoHealedConvs.set(conv.id, Date.now());
+                  logger.warn({
+                    convId: conv.id, oldChatId: finalChatId, contactId: conv.vaiContactId,
+                    msg_diagnosis: "chat existente não despacha · vai fechar antigo + criar novo (category:'pendente') + reenviar"
+                  }, "  ↳ 🔧 AUTO-HEAL v2 iniciado");
+                  try {
+                    // PASSO 1 · Fechar chat antigo (libera o slot · VAI permite só 1 aberto/contato/canal)
+                    // Sem isso, POST /chats devolve 409 "Já existe uma conversa aberta..."
+                    try {
+                      await vaiCloseChat(finalChatId, { notes: "auto-heal · chat zumbi não despachando · recriando" });
+                      logger.info({ convId: conv.id, oldChatId: finalChatId }, "  ↳ 🔧 chat antigo fechado · liberou slot");
+                    } catch (eClose){
+                      // Se o chat já estava fechado (404 ou 400), tudo bem · seguimos
+                      logger.warn({ convId: conv.id, oldChatId: finalChatId, err: eClose.message, status: eClose.status }, "  ↳ 🔧 close ignorado (provavelmente já fechado) · seguindo");
+                    }
+                    // Pequena espera pra VAI processar o close internamente
+                    await new Promise(rzz => setTimeout(rzz, 1500));
+
+                    // PASSO 2 · Cria chat fresco com category:"pendente" (fluxo validado)
+                    const fresh = await vaiCreateChat({ contactId: conv.vaiContactId });
+                    if (!fresh?.id) throw new Error("vaiCreateChat sem id");
+                    logger.info({ convId: conv.id, oldChatId: finalChatId, newChatId: fresh.id, protocol: fresh.protocol }, "  ↳ 🔧 chat fresco criado");
+
+                    // PASSO 3 · start-service força sessão WhatsApp Web a "acordar" pro chat novo
+                    try { await vaiStartService(fresh.id); logger.info({ chatId: fresh.id }, "  ↳ 🔧 start-service ok"); }
+                    catch (eSt){ logger.warn({ err: eSt.message }, "  ↳ 🔧 start-service ignorado"); }
+
+                    // PASSO 4 · Reenvia no chat fresco
+                    const retry = await vaiSendChatMessage(fresh.id, { content: text, type: "text" });
+                    logger.info({
+                      convId: conv.id, newChatId: fresh.id,
+                      retryMsgId: retry?.id, retryStatus: retry?.status
+                    }, "  ↳ 🔧 mensagem reenviada em chat fresco");
+
+                    // PASSO 5 · Persiste novo vaiConvId · próximas msgs vão direto pro chat novo
+                    await db.conversation.update({
+                      where: { id: conv.id },
+                      data: { vaiConvId: fresh.id }
+                    });
+                    logger.info({ convId: conv.id, oldChatId: finalChatId, newChatId: fresh.id }, "  ↳ 🔧 vaiConvId atualizado no banco");
+
+                    // Atualiza vaiMessageId do msg pro id do retry · canonical id
+                    // pos-heal pra dedup futuro de echo/bootstrap.
+                    if (retry?.id){
+                      try {
+                        await db.message.update({
+                          where: { id: msg.id },
+                          data: { vaiMessageId: String(retry.id) }
+                        });
+                      } catch (eUpd){
+                        logger.warn({ convId: conv.id, msgId: msg.id, err: eUpd.message }, "  ↳ 🔧 warn · falha ao persistir vaiMessageId pos-heal");
+                      }
+                    }
+
+                    // PASSO 6 · Re-checagem em 30s pra confirmar se chat fresco entregou
+                    if (retry?.id){
+                      setTimeout(async () => {
+                        try {
+                          const list2 = await vaiListChatMessages(fresh.id, { limit: "10" });
+                          const arr2 = Array.isArray(list2) ? list2 : (list2?.data || []);
+                          const m2 = arr2.find(x => x.id === retry.id);
+                          if (!m2){ logger.warn({ convId: conv.id, msgId: retry.id }, "  ↳ 🔧 re-check · msg sumiu"); return; }
+                          const ok = Boolean(m2.deliveredAt || m2.ack >= 2 || m2.status === "delivered" || m2.status === "read");
+                          logger.info({
+                            convId: conv.id, chatId: fresh.id, msgId: retry.id,
+                            status: m2.status, ack: m2.ack ?? null,
+                            deliveredAt: m2.deliveredAt ?? null,
+                            ok,
+                            diagnosis: ok
+                              ? "✅ AUTO-HEAL FUNCIONOU · chat fresco entregou"
+                              : "❌ AUTO-HEAL NÃO RESOLVEU · sessão WhatsApp da VAI realmente caída · checar painel/QR"
+                          }, "  ↳ 🔧 re-check pós-heal (30s)");
+                        } catch (e3){
+                          logger.warn({ convId: conv.id, err: e3.message, status: e3.status }, "  ↳ 🔧 re-check pós-heal falhou");
+                        }
+                      }, 30000);
+                    }
+                  } catch (eHeal){
+                    logger.error({ convId: conv.id, err: eHeal.message, status: eHeal.status }, "  ↳ 🔧 AUTO-HEAL v2 falhou");
+                    // Permite tentar heal de novo numa próxima · removendo do set
+                    _autoHealedConvs.delete(conv.id);
+                  }
+                } else if (!delivered && _hasAutoHealed(conv.id)){
+                  logger.warn({ convId: conv.id, chatId: finalChatId }, "  ↳ ❌ heal já tentado recentemente (TTL 5min) · não entregando = WhatsApp VAI caído (verificar painel)");
+                }
+              } catch (ee){
+                logger.warn({ convId: conv.id, chatId: finalChatId, msgId: finalMsgId, err: ee.message, status: ee.status }, "  ↳ 🔎 delivery_check falhou (rate-limit do polling?)");
+              }
+            }, 30000);
+          }
+        } else {
+          logger.warn({ convId: conv.id, reason: r.reason, error: r.error, status: r.status, sendMs }, "  ↳ ❌ VAI NÃO enviou");
+        }
+      } catch (e){
+        logger.warn({ err: e.message, convId: conv.id }, "vai outbound pipeline falhou");
+      }
+    })();
+
+    // Persiste no banco de CHAT (histórico) · garante que o dono seja o user logado
+    chatUpsertConversation({
+      id: conv.id,
+      crmUserId: req.user.id, crmUserEmail: req.user.email, crmUserName: req.user.name, crmUserRole: req.user.role,
+      leadId: conv.leadId, leadName: conv.lead.name, leadPhoneMask: conv.lead.phoneMasked,
+      vaiChatId: conv.vaiConvId, vaiContactId: conv.vaiContactId, vaiLid: conv.vaiLid, vaiPhone: conv.vaiPhone
+    });
+    chatInsertMessage({
+      conversationId: conv.id,
+      direction: "outbound",
+      fromRole: req.user.role === "ADMIN" ? "admin" : "associate",
+      senderUserId: req.user.id,
+      senderName: req.user.name,
+      content: text,
+      contentType: "text",
+      deliveredAt: new Date()
+    });
+
+    // PUSH real-time · admins veem outbound de todos os corretores
+    const nAdmin = sseToAdmins("message.outbound", {
+      conversationId: conv.id,
+      leadId: conv.leadId,
+      leadName: conv.lead.name,
+      text,
+      senderUserId: req.user.id,
+      senderName: req.user.name,
+      at: new Date().toISOString()
+    });
+    logger.debug({ convId: conv.id, admins: nAdmin, sseStats: sseStats() }, "  ↳ SSE outbound push para admins");
+
+    // Time gate: fora de 09h-19h BRT a entrega cai para <20% (erro 131049)
+    const _hBRT = parseInt(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo", hour: "numeric", hour12: false }));
+    const _offHours = _hBRT < 9 || _hBRT >= 20;
+    if (_offHours) logger.warn({ convId: conv.id, hora: _hBRT, text: text.slice(0,40) }, "⏰ OFF-HOURS · envio fora de 09h-19h BRT · risco alto 131049");
+    res.status(201).json({ id: msg.id, createdAt: msg.createdAt, ...(_offHours ? { warning: "off_hours", deliveryRisk: "alto" } : {}) });
+  } catch (e){ next(e); }
+});
+
+// POST /api/conversations/:id/media · upload + envio de mídia (multipart)
+// Form-data:
+//   file       → arquivo (obrigatório)
+//   content    → legenda (opcional)
+//   type       → override (opcional: image|audio|video|document|file)
+r.post("/:id/media", requireAuth, uploadMedia.single("file"), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "file_required" });
+    const conv = await db.conversation.findUnique({ where: { id: req.params.id }, include: { lead: true }});
+    if (!conv) return res.status(404).json({ error: "not_found" });
+    if (req.user.role !== "ADMIN"){
+      const a = await db.associate.findUnique({ where: { userId: req.user.id }, select: { id: true } });
+      if (conv.associateId !== a?.id) return res.status(403).json({ error: "forbidden" });
+    }
+
+    const content = (req.body?.content || "").toString();
+    const type    = (req.body?.type || guessContentType(req.file.mimetype));
+
+    logger.info({
+      flow: "chat_outbound_media", convId: conv.id, leadName: conv.lead.name, sender: req.user.email,
+      file: req.file.originalname, mime: req.file.mimetype, size: req.file.size, type
+    }, "📎 OUTBOUND · upload de mídia iniciado");
+
+    // 2026-05-11 · Transcoda áudio pra ogg/opus (WhatsApp friendly) se ainda não estiver
+    // no formato certo. Navegadores Chrome gravam webm/opus mesmo quando o blob é
+    // rotulado como audio/ogg, e o WhatsApp/VAI rejeita silenciosamente (mensagem
+    // "envia" mas o lead nunca recebe o áudio).
+    if (type === "audio"){
+      const okMime = /^audio\/(ogg|aac|mpeg|amr|mp4)$/.test(req.file.mimetype || "");
+      const looksOgg = req.file.buffer && req.file.buffer.length >= 4 &&
+        req.file.buffer.slice(0,4).toString() === "OggS";
+      if (!okMime || !looksOgg){
+        try {
+          const t0 = Date.now();
+          const converted = await transcodeAudioToOgg(req.file.buffer, req.file.mimetype);
+          logger.info({
+            convId: conv.id, oldMime: req.file.mimetype, oldSize: req.file.size,
+            newSize: converted.length, dur: Date.now() - t0
+          }, "🎤 audio · transcoded → ogg/opus");
+          req.file.buffer = converted;
+          req.file.mimetype = "audio/ogg";
+          req.file.size = converted.length;
+          req.file.originalname = (req.file.originalname || "audio").replace(/\.[^./]+$/, "") + ".ogg";
+        } catch (e){
+          logger.warn({ err: e.message, convId: conv.id }, "❌ audio · transcode falhou · seguindo com original");
+        }
+      }
+    }
+
+    // 2026-05-15 · TODA mídia (audio/image/video/document) vai 100% Meta Cloud.
+    // Why: VAI vinha entregando silenciosamente sem confirmação de entrega ·
+    // corretor pensava que mandou, lead nunca recebia. Cloud retorna erro
+    // explícito ou wamid + webhook de status. Se Cloud falhar, fail loud.
+    //
+    // Sem fallback VAI · qualquer falha vira erro 4xx/5xx pro corretor.
+
+    // Normaliza type pra um dos suportados pela Cloud (sticker/file viram document)
+    let cloudType = type;
+    if (cloudType === "sticker" || cloudType === "file") cloudType = "document";
+    const isSupported = ["audio", "image", "video", "document"].includes(cloudType);
+    if (!isSupported){
+      return res.status(415).json({
+        error: "unsupported_type", type,
+        message: `Tipo "${type}" não é suportado pelo WhatsApp Cloud.`
+      });
+    }
+
+    // Pre-check MIME aceito pela Meta
+    const mime = String(req.file.mimetype || "").toLowerCase();
+    const allowedRe = META_ALLOWED_MIMES[cloudType];
+    if (allowedRe && !allowedRe.test(mime)){
+      logger.warn({ convId: conv.id, mime, type, cloudType }, "❌ media · MIME não aceito pela Meta Cloud");
+      return res.status(415).json({
+        error: "mime_not_supported",
+        mime, type,
+        message: `Formato "${mime}" não aceito pelo WhatsApp para ${cloudType}. ` +
+          (cloudType === "image" ? "Use JPEG ou PNG." :
+           cloudType === "video" ? "Use MP4 (codec H.264 + AAC) ou 3GP." :
+           cloudType === "audio" ? "O áudio será transcodado automaticamente." :
+           "Use PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX ou TXT.")
+      });
+    }
+
+    // Pre-check tamanho
+    const limitMb = META_MEDIA_LIMITS_MB[cloudType] || 16;
+    if (req.file.size > limitMb * 1024 * 1024){
+      logger.warn({ convId: conv.id, size: req.file.size, type, cloudType, limitMb }, "❌ media · tamanho acima do limite Meta");
+      return res.status(413).json({
+        error: "file_too_large",
+        size: req.file.size, type, limitMb,
+        message: `Arquivo de ${(req.file.size/1024/1024).toFixed(1)}MB excede o limite de ${limitMb}MB para ${cloudType}.`
+      });
+    }
+
+    // Pre-check Cloud habilitado + telefone
+    if (!cloudEnabled()){
+      return res.status(503).json({ error: "cloud_disabled", message: "Envio de mídia requer WhatsApp Cloud. Avise o suporte." });
+    }
+    if (!conv.lead?.phoneEncrypted){
+      return res.status(422).json({ error: "no_phone", message: "Lead sem telefone decifrável." });
+    }
+    let phoneDigits = null;
+    try {
+      const phoneCloud = decryptPhone(conv.lead.phoneEncrypted);
+      phoneDigits = phoneCloud ? String(phoneCloud).replace(/\D/g, "") : null;
+    } catch (e){
+      logger.warn({ err: e.message, convId: conv.id }, "media · decrypt phone falhou");
+      return res.status(422).json({ error: "phone_decrypt_failed" });
+    }
+    if (!phoneDigits){
+      return res.status(422).json({ error: "phone_empty" });
+    }
+
+    // Salva cópia local em /midias/outbound/<kind>/<id>.<ext>
+    let localUrl = null;
+    try {
+      const ext = _extFromMime(req.file.mimetype);
+      const fname = `${Date.now()}-${randomUUID()}.${ext}`;
+      const dir = path.join(OUTBOUND_DIR, cloudType);
+      mkdirSync(dir, { recursive: true });
+      await writeFile(path.join(dir, fname), req.file.buffer);
+      localUrl = `/midias/outbound/${cloudType}/${fname}`;
+      logger.info({ convId: conv.id, fname, bytes: req.file.buffer.length, type: cloudType }, "💾 media · cópia local salva");
+    } catch (eLocal){
+      logger.warn({ err: eLocal.message, convId: conv.id }, "media · falha ao salvar cópia local");
+    }
+
+    // Upload + send via Meta Cloud
+    let cloudResult = null;
+    try {
+      logger.info({ convId: conv.id, leadName: conv.lead.name, type: cloudType, size: req.file.size }, "☁ media · enviando via Meta Cloud");
+      const sendR = await cloudUploadAndSendMedia({
+        to: phoneDigits,
+        buffer: req.file.buffer,
+        mimeType: req.file.mimetype,
+        filename: req.file.originalname,
+        type: cloudType,
+        caption: (cloudType === "image" || cloudType === "video" || cloudType === "document") ? content : "",
+        phoneNumberId: conv.inboundPhoneId
+      });
+      const mediaId = sendR.mediaId;
+      if (sendR.ok){
+        cloudResult = { ok: true, messageId: sendR.messageId, mediaId };
+        logger.info({ convId: conv.id, waMsgId: sendR.messageId, mediaId, type: cloudType }, "✅ media enviada via Meta Cloud");
+      } else if (sendR.reengagement){
+        logger.warn({ convId: conv.id, code: sendR.code, type: cloudType }, "❌ media · janela 24h fechada · precisa template antes");
+        return res.status(409).json({
+          error: "reengagement_required",
+          code: sendR.code,
+          message: "A janela de 24h com este lead fechou. Envie um template oficial Meta antes de mandar mídia."
+        });
+      } else {
+        logger.error({ convId: conv.id, code: sendR.code, status: sendR.status, err: sendR.error, type: cloudType }, "❌ media · Cloud falhou (fail loud)");
+        return res.status(502).json({
+          error: "cloud_send_failed",
+          code: sendR.code,
+          details: String(sendR.error || "").slice(0, 200),
+          message: "Não consegui enviar pelo WhatsApp oficial. Tente novamente em alguns instantes."
+        });
+      }
+    } catch (eCloud){
+      logger.error({ err: eCloud.message, convId: conv.id, type: cloudType }, "❌ media · exceção no Cloud (fail loud)");
+      return res.status(502).json({
+        error: "cloud_exception",
+        details: String(eCloud.message || "").slice(0, 200),
+        message: "Erro ao enviar pelo WhatsApp oficial. Tente de novo."
+      });
+    }
+
+    // URL canônica = local (consistente, iOS friendly, controle nosso)
+    const finalFileUrl = localUrl;
+
+    // Persiste no db principal · todo envio agora é provider=whatsapp_cloud
+    const msg = await db.message.create({
+      data: {
+        conversationId: conv.id,
+        direction: "outbound",
+        fromRole: req.user.role === "ADMIN" ? "admin" : "associate",
+        text: content,
+        contentType: type,
+        fileUrl: finalFileUrl,
+        fileName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        fileSize: req.file.size,
+        provider: "whatsapp_cloud",
+        whatsappMessageId: cloudResult.messageId,
+        messageStatus: "sent",
+        deliveredAt: new Date()
+      }
+    });
+
+    // firstContactAt
+    if (!conv.lead.firstContactAt){
+      await db.lead.update({ where: { id: conv.leadId }, data: { firstContactAt: new Date() } });
+    }
+    await db.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: new Date() } });
+
+    // Chat DB · sem vaiMessageId pois envio é 100% Cloud agora
+    chatUpsertConversation({
+      id: conv.id, crmUserId: req.user.id, crmUserEmail: req.user.email,
+      crmUserName: req.user.name, crmUserRole: req.user.role,
+      leadId: conv.leadId, leadName: conv.lead.name, leadPhoneMask: conv.lead.phoneMasked,
+      vaiChatId: conv.vaiConvId, vaiContactId: conv.vaiContactId
+    });
+    chatInsertMessage({
+      conversationId: conv.id,
+      direction: "outbound",
+      fromRole: req.user.role === "ADMIN" ? "admin" : "associate",
+      senderUserId: req.user.id, senderName: req.user.name,
+      content, contentType: type, fileUrl: finalFileUrl,
+      deliveredAt: new Date()
+    });
+
+    // SSE para admins
+    sseToAdmins("message.outbound", {
+      conversationId: conv.id, leadId: conv.leadId, leadName: conv.lead.name,
+      text: content, contentType: type, fileUrl: finalFileUrl,
+      senderUserId: req.user.id, senderName: req.user.name,
+      at: new Date().toISOString()
+    });
+
+    logger.info({
+      convId: conv.id, type,
+      via: "meta_cloud",
+      waMsgId: cloudResult.messageId,
+      fileUrl: finalFileUrl
+    }, "  ↳ ✅ mídia enviada");
+    res.status(201).json({
+      id: msg.id,
+      type,
+      fileUrl: finalFileUrl,
+      mimeType: req.file.mimetype,
+      size: req.file.size,
+      provider: "whatsapp_cloud",
+      whatsappMessageId: cloudResult.messageId,
+      createdAt: msg.createdAt
+    });
+  } catch (e){
+    logger.warn({ err: e.message, status: e.status }, "media upload failed");
+    next(e);
+  }
+});
+
+export default r;

@@ -1,0 +1,1067 @@
+// =============================================================================
+// CRM CALEBE ASSOCIADOS · Schema Prisma
+// PostgreSQL 16 · otimizado para 2000+ associados
+// =============================================================================
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+  extensions = [pgcrypto, citext]
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+enum Role {
+  ADMIN
+  ASSOCIATE
+  LEGAL
+  SECRETARY
+  DEV
+}
+
+enum AssociateCategory {
+  BRONZE
+  SILVER
+  GOLD
+  DIAMOND
+}
+
+enum AssociateStatus {
+  PENDING // aplicação submetida
+  APPROVED // ativo · recebe leads
+  DENIED // negado
+  INACTIVE // temporariamente desativado
+}
+
+enum LeadOrigin {
+  WEBHOOK // entrou via webhook (ads, parceiros)
+  IMPORT // veio de planilha
+  MANUAL // criado pelo associado (tel LIBERADO)
+  SYSTEM // criado pelo admin
+}
+
+enum LeadStatus {
+  NEW
+  QUALIFYING
+  NEGOTIATING
+  CLOSING
+  CLOSED
+  LOST
+}
+
+enum DistributionState {
+  PENDING // aguardando processamento
+  SCHEDULED // agendado para dia futuro
+  DISTRIBUTED // entregue a um associado
+  FAILED // erro na tentativa
+}
+
+enum ImportStatus {
+  RECEIVED
+  PROCESSING
+  VALIDATED
+  DISTRIBUTED
+  SCHEDULED
+  ERROR
+}
+
+enum WebhookLogStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  REJECTED
+  DEDUPLICATED
+}
+
+enum VisitStatus {
+  PENDING
+  CONFIRMED
+  DONE
+  CANCELLED
+  RESCHEDULED
+}
+
+enum SaleStatus {
+  DRAFT
+  SUBMITTED // enviada ao jurídico
+  IN_ANALYSIS
+  DRAFTING // elaboração
+  SIGNING
+  APPROVED
+  DENIED
+}
+
+enum StructureType {
+  PLANE
+  VEHICLE
+  APARTMENT
+  GUIDED_VISIT
+}
+
+enum StructureStatus {
+  PENDING
+  REVIEWING
+  APPROVED
+  DENIED
+  RESCHEDULED
+}
+
+enum AnnouncementTarget {
+  ALL
+  SEGMENT
+  INDIVIDUAL
+}
+
+// -----------------------------------------------------------------------------
+// USUÁRIOS E AUTENTICAÇÃO
+// -----------------------------------------------------------------------------
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique @db.Citext
+  passwordHash String
+  role         Role      @default(ASSOCIATE)
+  name         String
+  active       Boolean   @default(true)
+  commercialSupportAccess Boolean @default(false)
+  commercialOnly          Boolean @default(false) // 2026-06-16 · acesso ao módulo Ajuda Comercial (além de role ADMIN)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  // 2026-05-11 · Magic link de primeiro acesso (corretor recém-aprovado)
+  // Token único (sha256 hash) com expiração 7d. Quando o corretor abre o link
+  // e cria a senha, marcamos magicUsedAt = now() e o token deixa de funcionar.
+  magicTokenHash String?   @unique
+  magicExpiresAt DateTime?
+  magicUsedAt    DateTime?
+  magicSentAt    DateTime? // último envio do magic link (admin/reenvio bulk)
+
+  // 2026-05-11 · Presença · ping a cada 2min enquanto a aba tá aberta. Painel
+  // admin /corretores considera online se lastSeenAt > NOW - 5min.
+  lastSeenAt DateTime?
+
+  associate         Associate?
+  refreshTokens     RefreshToken[]
+  auditEvents       AuditEvent[]
+  notifications     Notification[]
+  pushSubscriptions PushSubscription[]
+  fcmTokens         FcmToken[]
+  // 2026-05-25 · Pedidos de assistência (F1 Éder)
+  assistsGiven      ConversationAssist[] @relation("AssistantAssists") // como suporte interno (recebe pedidos)
+  assistsRequested  ConversationAssist[] @relation("RequestedAssists") // como corretor que pediu ajuda
+  assistsResolved   ConversationAssist[] @relation("ResolvedAssists") // quem marcou como resolvido
+
+  @@index([email])
+  @@index([role, active])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique // hash SHA-256 do token (nunca o token puro)
+  family    String // rotação — mesma family = mesma sessão
+  revoked   Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  ipAddress String?
+  userAgent String?  @db.VarChar(512)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revoked])
+  @@index([family])
+  @@index([expiresAt])
+}
+
+// -----------------------------------------------------------------------------
+// ASSOCIADOS
+// -----------------------------------------------------------------------------
+model AssociateApplication {
+  id            String          @id @default(cuid())
+  name          String
+  email         String          @db.Citext
+  phone         String
+  cpf           String
+  rg            String?
+  creci         String
+  creciUf       String
+  city          String
+  currentAgency String?
+  yearsMarket   Int?
+  instagram     String?
+  notes         String?
+  credentialUrl String? // MinIO object key
+  status        AssociateStatus @default(PENDING)
+  reviewedBy    String? // userId do admin
+  reviewedAt    DateTime?
+  denialReason  String?
+  createdAt     DateTime        @default(now())
+
+  // Validação manual do admin (background check · só admin vê/edita)
+  // creciStatus: "APT" | "INAPT" | "WAITING"
+  // spcSerasaStatus / civilStatus / criminalStatus: "CLEAN" | "RESTRICTIONS" | "PENDING"
+  creciStatus         String?
+  spcSerasaStatus     String?
+  civilStatus         String?
+  criminalStatus      String?
+  backgroundNotes     String?
+  backgroundCheckedAt DateTime?
+  backgroundCheckedBy String? // userId do admin que preencheu
+
+  @@index([status, createdAt])
+  @@index([email])
+  @@index([creci])
+}
+
+model Associate {
+  id               String            @id @default(cuid())
+  userId           String            @unique
+  applicationId    String?           @unique
+  category         AssociateCategory @default(BRONZE)
+  segment          String            @default("Regional") // Alto padrão · Investidor · Lançamentos · Regional
+  status           AssociateStatus   @default(APPROVED)
+  creci            String
+  creciUf          String
+  phone            String?
+  whatsapp         String?
+  bio              String?
+  photoUrl         String?
+  cpf              String?
+  rg               String?
+  address          String?
+  bankData         String?
+  pixKey           String?
+  approvedAt       DateTime          @default(now())
+  lastActiveAt     DateTime? // última ação (login ou mensagem)
+  lastBulkDropAt   DateTime? // 2026-06-03 · último drop automático de 30 leads no login (1x/dia)
+  // Fila de boas-vindas WhatsApp · quando corretor aprovado sem binding VAI,
+  // guardamos a mensagem aqui e despachamos no 1º inbound dele (/api/webhooks/vai-flow).
+  welcomePending   String?
+  welcomePhoneHash String? // sha256 do phone normalizado pra match rápido no webhook
+  welcomeQueuedAt  DateTime?
+  welcomeSentAt    DateTime?
+  // 2026-06-10 · Suporte Técnico IA · phone do corretor no canal de suporte (9211-7994).
+  // Salvo automaticamente na 1ª identificação via CRECI pra não precisar perguntar de novo.
+  supportPhone     String?
+  phoneAlertActive Boolean   @default(false) // 2026-06-10 · tarja de alerta de telefone faltando
+
+  // 2026-05-11 · Bloqueio com motivo · quando admin bloqueia (status=INACTIVE),
+  // guarda o porquê e dispara template `calebe_acesso_bloqueado` pro corretor.
+  blockReason String?
+  blockedAt   DateTime?
+
+  // 2026-05-18 · Admin libera telefone real automaticamente em toda Conversation
+  // nova desse corretor. Sem isso, cada lead precisa de liberação manual.
+  autoReleasePhone Boolean @default(false)
+
+  // 2026-05-25 · Suporte interno (corretor da Calebe que atende como apoio aos
+  // corretores parceiros). Recebe conversas duplicadas via ConversationAssist
+  // quando outro corretor pede ajuda (avaliação, negociação, apoio comercial).
+  // Pode coexistir com múltiplos corretores de suporte (round-robin futuro).
+  isInternalSupport Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  leads         Lead[]
+  conversations Conversation[]
+  visits        Visit[]
+  sales         Sale[]
+  commissions   Commission[]
+  structureReqs StructureRequest[]
+
+  @@index([status, category])
+  @@index([segment])
+  @@index([lastActiveAt])
+  @@index([welcomePhoneHash])
+  @@index([isInternalSupport])
+}
+
+// -----------------------------------------------------------------------------
+// LEADS E DISTRIBUIÇÃO
+// -----------------------------------------------------------------------------
+model Lead {
+  id             String     @id @default(cuid())
+  name           String
+  phoneEncrypted Bytes // AES-256-GCM
+  phoneHash      String     @unique // dedup · SHA-256 normalizado
+  phoneMasked    String // (47) 9****-**34
+  source         String // instagram, google_ads, webhook, import, manual
+  origin         LeadOrigin @default(WEBHOOK)
+  segment        String     @default("Regional")
+  city           String?
+  notes          String?
+  status         LeadStatus @default(NEW)
+
+  // 2026-05-12 · Rastreabilidade de campanha · qual ad/lista trouxe este lead.
+  // - Imports de planilha: "Cliente Calebe (lista antiga)"
+  // - Webhook Meta Ads: nome da campanha (configurável)
+  // - null = sem rastreio
+  campaignName String?
+
+  // Atribuição
+  assignedAt           DateTime?
+  assignedToId         String?
+  firstContactAt       DateTime? // 1ª msg do associado — se null = pode redistribuir
+  redistributionCount  Int       @default(0)
+  lastRedistributionAt DateTime?
+
+  // 2026-05-12 · Disputa entre corretores · admin notifica N candidatos, primeiro a "Pegar" leva.
+  // disputeMode=true e disputeExpiresAt > NOW → lead ainda em disputa.
+  // Quando alguém pega: disputeMode=false, claimedAt=NOW, assignedToId=quemPegou.
+  // Se ninguém pegar até disputeExpiresAt: cron joga no rodízio normal.
+  disputeMode       Boolean   @default(false)
+  disputeStartedAt  DateTime?
+  disputeExpiresAt  DateTime?
+  disputeCandidates Json? // array de associateId (que foram notificados)
+  claimedAt         DateTime? // quando o assignedTo "pegou" o lead em disputa
+
+  // Imóvel vinculado
+  linkedPropertyId String?
+
+  // Discard
+  // 2026-06-03 · Flag sem WhatsApp · detectado automaticamente pelo webhook (erro 131026).
+  // Leads com noWhatsApp=true nunca são distribuídos nem recebem templates.
+  noWhatsApp    Boolean   @default(false)
+  noWhatsAppAt  DateTime?
+  // 2026-06-12 · Colunas já existiam no banco (via SQL) mas faltavam no schema →
+  // o client gerado rejeitava a escrita e a quarentena de lead bloqueado falhava.
+  blacklistReason String?
+  blacklistedAt   DateTime?
+
+  discardReason String?
+  discardedAt   DateTime?
+
+  // Identificadores VAI (preenchidos por webhook inbound · copiados para Conversation no assign)
+  vaiContactId  String?
+  vaiLastChatId String?
+  vaiLid        String?
+  vaiPhone      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assignedTo      Associate?          @relation(fields: [assignedToId], references: [id])
+  linkedProperty  Property?           @relation(fields: [linkedPropertyId], references: [id])
+  distribution    DistributionEntry?
+  conversation    Conversation?
+  redistributions RedistributionLog[]
+
+  @@index([status, assignedToId])
+  @@index([segment])
+  @@index([origin, createdAt])
+  @@index([assignedToId, firstContactAt]) // chave para redistribuição
+  @@index([createdAt])
+  @@index([vaiContactId])
+  @@index([campaignName])
+  @@index([disputeMode, disputeExpiresAt])
+}
+
+model DistributionRule {
+  id         String            @id @default(cuid())
+  category   AssociateCategory @unique
+  dailyQuota Int // máx leads/dia por associado
+  percentage Int // % do mix total (0-100)
+  priority   Int // 1=mais alta
+  updatedAt  DateTime          @updatedAt
+}
+
+model DistributionEntry {
+  id            String            @id @default(cuid())
+  leadId        String            @unique
+  scheduledFor  DateTime          @db.Date // dia agendado
+  state         DistributionState @default(PENDING)
+  distributedAt DateTime?
+  associateId   String? // preenchido quando distribuído
+  attemptCount  Int               @default(0)
+  notes         String?
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([state, scheduledFor])
+  @@index([associateId])
+}
+
+model RedistributionLog {
+  id                  String   @id @default(cuid())
+  leadId              String
+  previousAssociateId String
+  newAssociateId      String?
+  reason              String // "inactivity_login" · "inactivity_message" · "manual_admin"
+  attempt             Int
+  timestamp           DateTime @default(now())
+
+  lead Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([leadId])
+  @@index([timestamp])
+}
+
+// -----------------------------------------------------------------------------
+// IMPORTAÇÃO DE LEADS
+// -----------------------------------------------------------------------------
+model LeadImport {
+  id            String       @id @default(cuid())
+  fileName      String
+  fileSize      Int
+  totalRows     Int          @default(0)
+  validRows     Int          @default(0)
+  invalidRows   Int          @default(0)
+  duplicateRows Int          @default(0)
+  status        ImportStatus @default(RECEIVED)
+  createdBy     String // userId
+  createdAt     DateTime     @default(now())
+  processedAt   DateTime?
+  errorLog      Json?
+
+  @@index([status, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// WEBHOOK INBOUND
+// -----------------------------------------------------------------------------
+model WebhookInboundLog {
+  id              String           @id @default(cuid())
+  source          String // "vai" · "leads_external"
+  endpoint        String
+  rawPayload      Json
+  signature       String?
+  ipAddress       String?
+  idempotencyKey  String?          @unique
+  status          WebhookLogStatus @default(RECEIVED)
+  errorMessage    String?
+  resultingLeadId String?
+  createdAt       DateTime         @default(now())
+
+  @@index([source, status, createdAt])
+  @@index([idempotencyKey])
+}
+
+// -----------------------------------------------------------------------------
+// CONVERSAS E MENSAGENS
+// -----------------------------------------------------------------------------
+model Conversation {
+  id            String    @id @default(cuid())
+  leadId        String    @unique
+  associateId   String
+  vaiConvId     String? // chatId na VAI
+  vaiContactId  String? // id do contato na VAI (não muda)
+  vaiLid        String? // LID do WhatsApp (ex: 34283...@lid)
+  vaiPhone      String? // identifier real na VAI (ex: +5547...)
+  lastMessageAt DateTime?
+  // 2026-06-03 · last_customer_message_at · timestamp do ÚLTIMO inbound do cliente.
+  // FONTE AUTORITATIVA da janela de 24h (ver services/whatsappWindow.js). Mantido
+  // pelo webhook a cada inbound; backfill recalcula a partir da tabela Message.
+  lastInboundAt DateTime?
+  // 2026-06-03 · phone_number_id da Meta em que o LEAD fala com a gente (a Calebe
+  // recebe leads em >1 número). O ENVIO precisa sair por ESTE número, senão a Meta
+  // rejeita com 131047 (janela é por número). null = usa o número padrão do env.
+  inboundPhoneId String?
+  // 2026-06-03 · chat novo · lead ACEITO pelo corretor. default false → todas
+  // as conversas começam em "Pendente" (corretor aceita pra atender). O chat
+  // antigo ignora este campo (aditivo, não quebra nada).
+  accepted      Boolean   @default(false)
+  // 2026-06-13 · Fixar conversa no topo (estilo WhatsApp). Máx 5 por corretor (regra na API).
+  pinned        Boolean   @default(false)
+  pinnedAt      DateTime?
+  acceptedAt    DateTime?
+  manualFree    Boolean   @default(false) // true se lead origin = MANUAL (libera tel)
+  phoneReleased Boolean   @default(false) // liberação admin
+  createdAt     DateTime  @default(now())
+
+  lead      Lead                 @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  associate Associate            @relation(fields: [associateId], references: [id], onDelete: Restrict)
+  messages  Message[]
+  assists   ConversationAssist[] // 2026-05-25 · F1 Éder · pedidos de assistência
+
+  @@index([associateId, lastMessageAt])
+  @@index([lastInboundAt])
+  @@index([vaiContactId])
+  @@index([vaiLid])
+}
+
+// -----------------------------------------------------------------------------
+// 2026-05-25 · F1 ÉDER · Assistência entre corretores
+// Quando um corretor parceiro precisa de ajuda em uma conversa (avaliação de
+// imóvel, ajuda em negociação, apoio comercial), abre uma "janela duplicada"
+// pro corretor de suporte interno (Éder). A conversa segue na carteira do
+// corretor original (Lead.assignedToId não muda). O assistente VÊ tudo (chat,
+// telefone real, justificativa) mas não ENVIA mensagens diretas — aconselha
+// fora do app.
+// -----------------------------------------------------------------------------
+model ConversationAssist {
+  id              String    @id @default(cuid())
+  conversationId  String
+  assistantUserId String? // null até aceitar (fluxo comercial) · User.id do parceiro (fluxo partner)
+  requestedById   String // User.id do corretor parceiro que pediu
+  type            String // "Avaliação" | "Negociação" | "Apoio" | "Outro"
+  justification   String // texto livre obrigatório
+  status          String    @default("PENDING") // PENDING | RESOLVED | CANCELLED
+  resolvedAt      DateTime?
+  resolvedById    String?
+  resolutionNote  String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  // 2026-06-16 · Ajuda Comercial Calebe (kind=COMMERCIAL). status comercial: SOLICITADO|EM_ANALISE|ATUANDO|FINALIZADO|CANCELADO
+  kind                 String    @default("PARTNER")
+  assignedCalebeUserId String?   // quem do time Calebe assumiu (set no accept)
+  acceptedAt           DateTime?
+  inAnalysisAt         DateTime?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  assistant    User?        @relation("AssistantAssists", fields: [assistantUserId], references: [id])
+  notes        ConversationAssistNote[]
+  requestedBy  User         @relation("RequestedAssists", fields: [requestedById], references: [id])
+  resolvedBy   User?        @relation("ResolvedAssists", fields: [resolvedById], references: [id])
+
+  @@index([assistantUserId, status, createdAt])
+  @@index([conversationId, status])
+  @@index([requestedById, status])
+}
+
+// 2026-06-16 · Observações internas da Ajuda Comercial (só ADM autorizado vê)
+model ConversationAssistNote {
+  id        String   @id @default(cuid())
+  assistId  String
+  userId    String   // autor (User.id)
+  note      String
+  createdAt DateTime @default(now())
+  assist    ConversationAssist @relation(fields: [assistId], references: [id], onDelete: Cascade)
+
+  @@index([assistId])
+}
+
+model Message {
+  id             String    @id @default(cuid())
+  conversationId String
+  direction      String // "inbound" | "outbound"
+  fromRole       String // "lead" | "associate" | "system"
+  text           String
+  contentType    String    @default("text") // text | image | audio | video | document | file | sticker | gif
+  fileUrl        String? // URL S3 da mídia (se contentType != text)
+  fileName       String? // nome original do arquivo
+  mimeType       String?
+  fileSize       Int?
+  vaiMessageId   String?
+  deliveredAt    DateTime?
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  // 2026-05-11 · Cloud API oficial Meta (corretor↔lead)
+  // provider: "vai" (default p/ backcompat) | "whatsapp_cloud"
+  // templateName: nome do template Meta quando direction=outbound e provider=whatsapp_cloud
+  // whatsappMessageId: id retornado pela Cloud API (wamid.HBgN...) · permite match com webhook de status
+  // messageStatus: sent | delivered | read | failed | accepted (último status recebido via webhook)
+  // failedAt + errorReason: falhas reportadas pela Meta (rate limit, 24h window expired, número inválido, etc)
+  provider          String?   @default("vai")
+  templateName      String?
+  whatsappMessageId String?
+  messageStatus     String?
+  failedAt          DateTime?
+  errorReason       String?
+
+  // 2026-06-21 · ocultar tentativas sem resposta do cliente
+  hiddenAt          DateTime?
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([whatsappMessageId])
+}
+
+// Solicitação de liberação de telefone (corretor → admin)
+model PhoneReleaseRequest {
+  id             String    @id @default(cuid())
+  conversationId String
+  leadId         String
+  requestedById  String // User.id do corretor
+  justification  String
+  status         String    @default("PENDING") // PENDING | APPROVED | DENIED
+  decidedById    String? // admin que aprovou/negou
+  decisionNote   String?
+  createdAt      DateTime  @default(now())
+  decidedAt      DateTime?
+
+  @@index([status, createdAt])
+  @@index([conversationId])
+}
+
+// -----------------------------------------------------------------------------
+// IMÓVEIS
+// -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// EMPREENDIMENTO (Development) · nível 1 de cadastro de imóveis
+// Agrupa várias unidades (Property) sob um mesmo prédio/condomínio, com as
+// características compartilhadas (área comum, lazer, localização, entrega).
+// -----------------------------------------------------------------------------
+model Development {
+  id          String  @id @default(cuid())
+  code        String  @unique // ex: "MERAKI-HR" (curto, usado em LP/contratos)
+  name        String // nome comercial ex: "Meraki Home Resort"
+  description String? // descrição comercial geral
+
+  // Localização
+  address      String?
+  neighborhood String
+  city         String
+  state        String // UF
+  zipCode      String?
+
+  // Características gerais
+  developmentType String? // Residencial, Misto, Comercial
+  totalUnits      Int? // total de unidades planejadas
+  totalFloors     Int? // andares
+  totalTowers     Int? // torres
+  deliveryDate    DateTime? // data prevista de entrega
+  launchDate      DateTime? // data de lançamento
+
+  // Áreas comuns e lazer · listas de strings (JSON posgres[])
+  commonAreas     String[] // ex: ["Piscina", "Academia", "Salão de festas"]
+  leisureFeatures String[] // ex: ["Spa", "Rooftop", "Espaço gourmet"]
+  differentials   String? // texto livre
+
+  // Construtora / registro
+  builder        String? // construtora/incorporadora
+  registryNumber String? // matrícula do terreno (ORI)
+
+  status String @default("ACTIVE") // ACTIVE | SOLD_OUT | DELIVERED | SUSPENDED
+
+  // 2026-05-12 · Capa, vídeo, mapa, comissão padrão e flags de aceitação
+  coverImageUrl         String?
+  videoUrl              String?
+  latitude              Float?
+  longitude             Float?
+  commissionDefault     String? // "2,5%" · usado como default ao criar Property
+  acceptsPermuta        Boolean  @default(true)
+  acceptsParcelado      Boolean  @default(true)
+  cubBaseValue          Decimal? @db.Decimal(12, 2) // valor base p/ simulador CUB
+  // 2026-05-13 · Capa do card: tipologias [{ suites, valorAvista }] + permuta/parcelado único
+  tipologias            Json? // [{ "suites": 2, "valorAvista": 749000 }, ...]
+  valorPermutaParcelado Decimal? @db.Money // valor único pra permuta + parcelado (mesmo valor)
+  dwvId                 String? // ID do empreendimento na plataforma DWV (futuro import)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  units Property[]
+
+  @@index([status, city])
+  @@index([deliveryDate])
+}
+
+// -----------------------------------------------------------------------------
+// PROPERTY · nível 2 (unidade/apartamento individual)
+// Mantido o nome Property por compatibilidade com Lead/Visit/Sale (FKs antigas).
+// Opcionalmente vinculado a um Development (developmentId).
+// -----------------------------------------------------------------------------
+model Property {
+  id             String    @id @default(cuid())
+  code           String    @unique // código curto da unidade (ex: "MRK-2502")
+  title          String // título descritivo (ex: "Cobertura 2502 · Meraki")
+  neighborhood   String
+  city           String
+  value          Decimal   @db.Money // valor principal exibido
+  commission     String // "2,5%"
+  propertyType   String // "Apartamento alto padrão"
+  area           String? // "128 m²"
+  bedrooms       Int?
+  suites         Int?
+  garages        Int?
+  description    String?
+  features       String[]
+  isSpecial      Boolean   @default(false)
+  status         String    @default("AVAILABLE") // AVAILABLE | RESERVED | SOLD
+  // 2026-05-12 · timestamp do momento que virou SOLD · usado pra mostrar faixa "VENDIDO" recente
+  markedAsSoldAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  // Vínculo opcional com o empreendimento (nível 1). Nullable para manter imóveis avulsos.
+  developmentId String?
+  development   Development? @relation(fields: [developmentId], references: [id], onDelete: SetNull)
+
+  // Campos específicos da unidade
+  unitNumber String? // "2502" ou "Bloco A · Apto 101"
+  tower      String? // "Torre Solaris"
+  floor      Int?
+  unitType   String? // "Tipo 1", "Cobertura", "Garden"
+  priceList  Decimal? @db.Money // valor de tabela
+  priceCash  Decimal? @db.Money // valor à vista
+
+  media  PropertyMedia[]
+  leads  Lead[]
+  visits Visit[]
+  sales  Sale[]
+
+  @@index([status, city])
+  @@index([isSpecial])
+  @@index([developmentId, status])
+}
+
+model PropertyMedia {
+  id         String   @id @default(cuid())
+  propertyId String
+  url        String // MinIO object URL ou externa
+  mediaType  String // "image" | "video"
+  order      Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@index([propertyId, order])
+}
+
+// -----------------------------------------------------------------------------
+// VISITAS
+// -----------------------------------------------------------------------------
+model Visit {
+  id          String      @id @default(cuid())
+  associateId String
+  leadName    String
+  propertyId  String
+  scheduledAt DateTime
+  status      VisitStatus @default(PENDING)
+  notes       String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  associate Associate @relation(fields: [associateId], references: [id])
+  property  Property  @relation(fields: [propertyId], references: [id])
+
+  @@index([associateId, scheduledAt])
+  @@index([status])
+}
+
+// -----------------------------------------------------------------------------
+// VENDAS E JURÍDICO
+// -----------------------------------------------------------------------------
+model Sale {
+  id                  String     @id @default(cuid())
+  code                String     @unique @default(cuid())
+  associateId         String
+  propertyId          String
+  clientDataEncrypted Bytes // CPF · RG · dados bancários — AES
+  clientName          String // nome em claro (para exibição)
+  finalValue          Decimal    @db.Money
+  paymentConditions   String?
+  status              SaleStatus @default(DRAFT)
+  submittedAt         DateTime?
+  approvedAt          DateTime?
+  denialReason        String?
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  associate  Associate      @relation(fields: [associateId], references: [id])
+  property   Property       @relation(fields: [propertyId], references: [id])
+  documents  SaleDocument[]
+  commission Commission?
+
+  @@index([associateId, status])
+  @@index([status, createdAt])
+}
+
+model SaleDocument {
+  id         String   @id @default(cuid())
+  saleId     String
+  docType    String // "rg" · "cpf" · "comprovante_renda"
+  fileKey    String // MinIO
+  uploadedAt DateTime @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([saleId])
+}
+
+// -----------------------------------------------------------------------------
+// COMISSÕES
+// -----------------------------------------------------------------------------
+model Commission {
+  id            String    @id @default(cuid())
+  saleId        String    @unique
+  associateId   String
+  grossValue    Decimal   @db.Money
+  netValue      Decimal   @db.Money
+  dueDate       DateTime?
+  paidAt        DateTime?
+  status        String    @default("pending") // pending · approved · paid
+  paymentMethod String?
+  notes         String?
+  createdAt     DateTime  @default(now())
+
+  sale      Sale      @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  associate Associate @relation(fields: [associateId], references: [id])
+
+  @@index([associateId, status])
+  @@index([status, dueDate])
+}
+
+// -----------------------------------------------------------------------------
+// ESTRUTURA PREMIUM (avião / carro / apt / visita)
+// -----------------------------------------------------------------------------
+model StructureRequest {
+  id             String          @id @default(cuid())
+  associateId    String
+  structureType  StructureType
+  requestedDate  DateTime
+  urgency        String // low · medium · high
+  linkedLeadName String?
+  linkedValue    Decimal?        @db.Money
+  city           String?
+  motive         String          @db.Text // justificativa obrigatória
+  status         StructureStatus @default(PENDING)
+  respondedBy    String? // userId do responsável
+  respondedAt    DateTime?
+  responseNotes  String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  associate Associate @relation(fields: [associateId], references: [id])
+
+  @@index([status, createdAt])
+  @@index([associateId])
+}
+
+// -----------------------------------------------------------------------------
+// NOTIFICAÇÕES E AVISOS
+// -----------------------------------------------------------------------------
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String?
+  type      String // "lead_assigned" · "sale_approved" · "announcement"
+  link      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt])
+}
+
+model Announcement {
+  id            String             @id @default(cuid())
+  title         String
+  body          String
+  target        AnnouncementTarget @default(ALL)
+  targetSegment String? // se target = SEGMENT
+  targetUserId  String? // se target = INDIVIDUAL
+  imageUrl      String?
+  documentUrl   String?
+  videoUrl      String? // upload local de video (mp4/webm) · alternativa ao YouTube embed
+  showOnLogin   Boolean            @default(false)
+  createdBy     String // userId
+  createdAt     DateTime           @default(now())
+  expiresAt     DateTime?
+
+  reads AnnouncementRead[]
+
+  @@index([target, createdAt])
+}
+
+model AnnouncementRead {
+  id             String   @id @default(cuid())
+  announcementId String
+  userId         String
+  readAt         DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+
+  @@unique([announcementId, userId])
+}
+
+// -----------------------------------------------------------------------------
+// SETTINGS (configurações do sistema)
+// -----------------------------------------------------------------------------
+model SystemSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     Json
+  updatedAt DateTime @updatedAt
+  updatedBy String? // userId
+}
+
+// -----------------------------------------------------------------------------
+// AUDIT EVENT (imutável — triggers postgres impedem UPDATE/DELETE)
+// -----------------------------------------------------------------------------
+model AuditEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  actorEmail String?
+  action     String // LOGIN · LEAD_PHONE_DECRYPTED · LEAD_REDISTRIBUTED · etc
+  entity     String // Lead:id · Sale:id · User:id
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?  @db.VarChar(512)
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([entity])
+}
+
+// Web Push subscriptions (VAPID).
+model PushSubscription {
+  id         String   @id @default(cuid())
+  userId     String
+  endpoint   String   @unique
+  p256dh     String
+  authKey    String
+  userAgent  String?
+  platform   String?
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// 2026-05-12 · Gravação + transcrição de chamadas Twilio (voice bridge)
+// Cada ligação gera 1 row · webhook atualiza recordingUrl quando Twilio termina,
+// e processRecording() preenche transcript + flaggedWords via Whisper API.
+model CallRecording {
+  id            String    @id
+  callSid       String    @unique
+  leadId        String?
+  associateId   String?
+  associateName String?
+  leadName      String?
+  fromNumber    String?
+  toNumber      String?
+  durationSec   Int       @default(0)
+  recordingUrl  String?
+  recordingSid  String?
+  transcript    String?
+  flaggedWords  String[]
+  flaggedAt     DateTime?
+  transcribedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([leadId])
+  @@index([associateId])
+  @@index([flaggedAt])
+}
+
+// 2026-06-09 · Envio de permuta/avaliação pelo corretor (imóvel ou carro) — admin revisa.
+model Permuta {
+  id              String   @id @default(cuid())
+  associateId     String?
+  associateNome   String?
+  nome            String
+  telefone        String?
+  tipoNegociacao  String
+  imovelAvaliacao String?
+  imovelObs       String?
+  imovelFotos     String[]
+  carroFotos      String[]
+  carroDocUrl     String?
+  status          String   @default("NOVO")
+  createdAt       DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// FCM tokens (push nativo Capacitor iOS/Android via firebase-admin).
+model FcmToken {
+  id         String   @id @default(cuid())
+  userId     String
+  token      String   @unique
+  platform   String?
+  userAgent  String?
+  lastSeenAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// 2026-06-22 · Toggle admin por evento de push (FCM/APNs + Web Push).
+// Cada linha = 1 evento de negócio (key única). isActive=false bloqueia o disparo
+// no guard interno de services/push.js#sendPushToUser. Seed em scripts/seed_push_notification_settings.mjs.
+model PushNotificationSetting {
+  key         String   @id
+  label       String
+  description String
+  category    String
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([category])
+}
+
+
+// -----------------------------------------------------------------------------
+// CAMPANHAS DE WHATSAPP (Central de Campanhas · 2026-07-01)
+// -----------------------------------------------------------------------------
+model Campaign {
+  id               String    @id @default(cuid())
+  name             String
+  phoneNumberIds   String[]  @default([])
+  templateName     String
+  languageCode     String    @default("pt_BR")
+  targetCount      Int
+  intervalMs       Int       @default(8000)
+  onlyNotContacted Boolean   @default(true)
+  status           String    @default("draft")
+  createdById      String?
+  createdAt        DateTime  @default(now())
+  startedAt        DateTime?
+  finishedAt       DateTime?
+  statSent         Int       @default(0)
+  statFailed       Int       @default(0)
+  statNoWhatsapp   Int       @default(0)
+  statResponded    Int       @default(0)
+  recipients       CampaignRecipient[]
+
+  @@index([status])
+}
+
+model CampaignRecipient {
+  id          String    @id @default(cuid())
+  campaignId  String
+  leadId      String
+  status      String    @default("queued")
+  phoneId     String?
+  waMessageId String?
+  errorReason String?
+  sentAt      DateTime?
+  respondedAt DateTime?
+  roletaStatus     String?
+  roletaHolderId   String?
+  roletaAssignedAt DateTime?
+  roletaAttempts   Int       @default(0)
+  roletaTried      String[]  @default([])
+  createdAt   DateTime  @default(now())
+  campaign    Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId, status])
+  @@index([leadId])
+}
+
+
+// Instrumentação de uso de telas (auditoria 2026-07-02) — pra aposentar rota legada com prova.
+model RouteHit {
+  id        String   @id @default(cuid())
+  path      String
+  day       String
+  role      String
+  count     Int      @default(1)
+  updatedAt DateTime @default(now())
+
+  @@unique([path, day, role])
+}

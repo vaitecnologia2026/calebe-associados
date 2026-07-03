@@ -1,0 +1,425 @@
+// =============================================================================
+// /api/whatsapp · endpoints da plataforma para Cloud API oficial Meta
+//
+// - GET  /api/whatsapp/templates                         lista templates aprovados
+// - POST /api/whatsapp/conversations/:id/send-template   corretor dispara template
+// - POST /api/whatsapp/conversations/:id/send-text       corretor envia texto livre (24h window)
+//
+// Auth: requireAuth + ownership check (corretor só envia em conversas suas; admin envia em qualquer).
+// =============================================================================
+import { Router } from "express";
+import { z } from "zod";
+import { db } from "../db.js";
+import { requireAuth } from "../auth/middleware.js";
+import { logger } from "../utils/logger.js";
+import { audit } from "../utils/audit.js";
+import { decrypt, normalizePhone } from "../crypto.js";
+import { chatUpsertConversation, chatInsertMessage } from "../chatDb.js";
+import { sseToMany } from "./../services/sseHub.js";
+import {
+  isEnabled,
+  listTemplates,
+  sendTemplate,
+  sendText,
+  clearTemplateCache
+} from "../services/whatsappCloud.js";
+
+const r = Router();
+
+// ----- Helpers --------------------------------------------------------------
+
+async function loadConversationForUser(convId, user){
+  const conv = await db.conversation.findUnique({
+    where: { id: convId },
+    include: {
+      lead: true,
+      associate: { include: { user: { select: { id: true, name: true, email: true } } } }
+    }
+  });
+  if (!conv) return { error: { status: 404, message: "conversation_not_found" } };
+  if (user.role !== "ADMIN"){
+    const a = await db.associate.findUnique({ where: { userId: user.id }, select: { id: true } });
+    if (!a) return { error: { status: 403, message: "no_associate_record" } };
+    // Aceita ownership via conv.associateId OU lead.assignedToId (cobre gap de
+    // sync apos transferencia). Se for owner via lead, ressincroniza a conv.
+    const isConvOwner = conv.associateId === a.id;
+    const isLeadOwner = conv.lead?.assignedToId === a.id;
+    if (!isConvOwner && !isLeadOwner){
+      logger.warn({ convId, userId: user.id, associateId: a.id, convAssoc: conv.associateId, leadAssoc: conv.lead?.assignedToId }, "wa_cloud · forbidden · corretor nao eh dono");
+      return { error: { status: 403, message: "forbidden" } };
+    }
+    if (!isConvOwner && isLeadOwner){
+      await db.conversation.update({ where: { id: conv.id }, data: { associateId: a.id } }).catch(()=>{});
+      conv.associateId = a.id;
+    }
+  }
+  return { conv };
+}
+
+function getLeadPhone(lead){
+  if (!lead?.phoneEncrypted) return null;
+  try {
+    const raw = decrypt(lead.phoneEncrypted);
+    return normalizePhone(raw); // 55DDDXXXXXXXX (sem '+')
+  } catch (e){
+    logger.error({ err: e.message, leadId: lead?.id }, "lead_phone_decrypt_failed");
+    return null;
+  }
+}
+
+async function persistOutboundMessage({ conv, user, text, templateName, providerMessageId, status }){
+  const msg = await db.message.create({
+    data: {
+      conversationId: conv.id,
+      direction: "outbound",
+      fromRole: user.role === "ADMIN" ? "system" : "associate",
+      text,
+      contentType: "text",
+      provider: "whatsapp_cloud",
+      templateName: templateName || null,
+      whatsappMessageId: providerMessageId || null,
+      messageStatus: status || "sent",
+      deliveredAt: status === "sent" ? new Date() : null
+    }
+  });
+
+  // Atualiza firstContactAt (impede redistribuição)
+  if (!conv.lead.firstContactAt){
+    await db.lead.update({ where: { id: conv.leadId }, data: { firstContactAt: new Date() } });
+    await audit({ action: "LEAD_FIRST_CONTACT", entity: `Lead:${conv.leadId}`, metadata: { conversationId: conv.id, channel: "whatsapp_cloud" } });
+  }
+  await db.conversation.update({ where: { id: conv.id }, data: { lastMessageAt: new Date() } });
+  if (user.role === "ASSOCIATE"){
+    await db.associate.updateMany({ where: { userId: user.id }, data: { lastActiveAt: new Date() } });
+  }
+
+  // Espelha no chat DB (best-effort · await pra garantir persistência antes de responder)
+  try {
+    await chatUpsertConversation({
+      id: conv.id,
+      crmUserId: user.id,
+      crmUserEmail: user.email,
+      crmUserName: user.name,
+      crmUserRole: user.role,
+      leadId: conv.leadId,
+      leadName: conv.lead.name,
+      leadPhoneMask: conv.lead.phoneMasked
+    });
+    await chatInsertMessage({
+      conversationId: conv.id,
+      direction: "outbound",
+      fromRole: user.role === "ADMIN" ? "admin" : "associate",
+      senderUserId: user.id,
+      senderName: user.name,
+      content: text,
+      vaiMessageId: null,
+      metadata: { provider: "whatsapp_cloud", templateName: templateName || null, whatsappMessageId: providerMessageId || null },
+      deliveredAt: status === "sent" ? new Date() : null
+    });
+  } catch (e){
+    logger.warn({ err: e.message, convId: conv.id }, "chatDb persist outbound failed");
+  }
+
+  // SSE push pro dono + admins (mensagem ja salva = visivel ao reload tambem)
+  const ownerIds = conv.associate?.userId ? [conv.associate.userId] : [];
+  sseToMany(ownerIds, "message.outbound", {
+    conversationId: conv.id,
+    messageId: msg.id,
+    text,
+    provider: "whatsapp_cloud",
+    templateName: templateName || null,
+    createdAt: msg.createdAt
+  });
+
+  return msg;
+}
+
+// ----- GET /templates -------------------------------------------------------
+
+// Cache HTTP curto · reduz pressão na Graph API quando admin abre lista repetidamente
+r.get("/templates", requireAuth, async (req, res, next) => {
+  try {
+    if (!isEnabled()) return res.status(503).json({ error: "whatsapp_cloud_disabled" });
+    const bypass = req.query.refresh === "1";
+    if (bypass) clearTemplateCache();
+    const templates = await listTemplates({ bypassCache: bypass, status: "APPROVED" });
+
+    // 2026-05-11 · Allowlist · filtra os que aparecem no dropdown. Sem essa env,
+    // mostra todos aprovados. Com env, só os nomes listados (comma-separated).
+    // Admin pode usar ?expose=1 pra bypass do filtro e ver todos.
+    const allowlist = (process.env.WHATSAPP_TEMPLATE_ALLOWLIST || "")
+      .split(",").map(s => s.trim()).filter(Boolean);
+    const expose = req.query.expose === "1" && req.user.role === "ADMIN";
+    const filtered = (allowlist.length && !expose)
+      ? templates.filter(t => allowlist.includes(t.name))
+      : templates;
+
+    // Reduz payload pro frontend · só o que importa pra escolher e renderizar preview
+    const lite = filtered.map(t => ({
+      name: t.name,
+      language: t.language,
+      category: t.category,
+      status: t.status,
+      qualityScore: t.quality_score?.score || null,
+      components: t.components // mantém pra frontend renderizar preview com {{1}}, {{2}}...
+    }));
+    res.json({ data: lite, total: lite.length, allowlisted: allowlist.length > 0 && !expose });
+  } catch (e){ next(e); }
+});
+
+// ----- POST /conversations/:id/send-template --------------------------------
+
+const sendTemplateSchema = z.object({
+  templateName:  z.string().min(1).max(512),
+  languageCode:  z.string().min(2).max(20),
+  bodyParams:    z.array(z.string()).max(20).default([]),
+  headerParams:  z.any().optional()  // formato livre · Meta espera array de objetos {type, text|image|video|document}
+});
+
+r.post("/conversations/:id/send-template", requireAuth, async (req, res, next) => {
+  try {
+    if (!isEnabled()) return res.status(503).json({ error: "whatsapp_cloud_disabled" });
+    const input = sendTemplateSchema.parse(req.body);
+
+    // 2026-06-30 · Verifica blacklist ANTES de enviar (evita envio desnecessário à Meta).
+    // noWhatsApp=true = número inválido (131026) ou opt-out (131050) ou pausa 131049.
+    const leadForCheck = await db.lead.findFirst({
+      where: { conversation: { id: req.params.id } },
+      select: { id: true, noWhatsApp: true, blacklistReason: true }
+    }).catch(() => null);
+    if (leadForCheck?.noWhatsApp) {
+      const reason = leadForCheck.blacklistReason ?? '';
+      // 2026-07-01 · 131049 REMOVIDO do bloqueio: pausa de qualidade temporária do NÚMERO (round-robin trata), não do lead. Corretor pode enviar normalmente.
+      if (reason === 'invalid_number' || reason.startsWith('131026')) {
+        return res.status(422).json({ error: 'lead_invalid_number', message: 'Número sem WhatsApp — não é possível enviar mensagens para este contato.' });
+      }
+      if (reason === 'opted_out' || reason.startsWith('131050')) {
+        return res.status(422).json({ error: 'lead_opted_out', message: 'Este contato optou por não receber mensagens.' });
+      }
+    }
+    // 2026-06-12 · BLOQUEIO DURO: templates de \"cadastro/registro/pendência\" foram
+    // proibidos comercialmente (soam falsos pro cliente). Bloqueia no servidor mesmo
+    // que o corretor tenha um app antigo em cache que ainda mostre o template.
+    const TEMPLATES_BLOQUEADOS = new Set([
+      "calebe_cadastro_confirmado_u",
+      "calebe_pendencia_cadastro_u",
+      "calebe_corretor_designado_u",
+      "calebe_continuidade_atendimento_u",
+      "calebe_horario_contato_u",
+      "calebe_encerramento_registro_u"
+    ]);
+    if (TEMPLATES_BLOQUEADOS.has(input.templateName)){
+      // 409 (não 403) · 403 fazia o frontend mostrar \"sem permissão, não admin\" — enganoso.
+      return res.status(409).json({ error: "template_bloqueado", message: "Template desatualizado — recarregue a página (F5) e use os templates atuais." });
+    }
+    const { conv, error } = await loadConversationForUser(req.params.id, req.user);
+    if (error) return res.status(error.status).json({ error: error.message });
+
+    const to = getLeadPhone(conv.lead);
+    if (!to) return res.status(422).json({ error: "phone_unavailable" });
+
+    logger.info({
+      flow: "wa_cloud_send_template", convId: conv.id, leadId: conv.leadId,
+      template: input.templateName, lang: input.languageCode, paramsCount: input.bodyParams.length,
+      sender: req.user.email
+    }, "📤 wa_cloud · enviando template");
+
+    const r1 = await sendTemplate({
+      to,
+      templateName: input.templateName,
+      languageCode: input.languageCode,
+      bodyParams: input.bodyParams,
+      headerParams: input.headerParams || null,
+      // 2026-06-03 · reabordagem sai pelo MESMO número que o lead usou (mantém 1 thread).
+      phoneNumberId: conv.inboundPhoneId
+    });
+
+    if (!r1.ok){
+      logger.warn({ convId: conv.id, err: r1.error, status: r1.status, code: r1.code }, "wa_cloud · template falhou");
+      return res.status(r1.status || 502).json({ error: "send_failed", reason: r1.error, code: r1.code, body: r1.body });
+    }
+
+    // 2026-06-09 · round-robin: persiste o phoneId usado na conversa.
+    // Garante que futuras mensagens usem o mesmo número e que o webhook
+    // de resposta do lead seja roteado corretamente.
+    if (!conv.inboundPhoneId && r1.sentPhoneId){
+      await db.conversation.update({ where: { id: conv.id }, data: { inboundPhoneId: r1.sentPhoneId } })
+        .catch(e => logger.warn({ convId: conv.id, err: e.message }, "wa_cloud · update inboundPhoneId non-fatal"));
+      conv.inboundPhoneId = r1.sentPhoneId;
+    }
+
+    // Renderiza o BODY oficial do template com os bodyParams pra exibir no
+    // historico do CRM exatamente como o lead recebe (ex: "Ola Helga, tudo
+    // bem com voce?"). Cai pro fallback dos params se nao achar o template.
+    let persistedText;
+    try {
+      const tpls = await listTemplates({ status: "APPROVED" }).catch(() => []);
+      const tpl  = tpls.find(t => t.name === input.templateName && t.language === input.languageCode);
+      const body = (tpl?.components || []).find(c => (c.type || "").toUpperCase() === "BODY")?.text || "";
+      if (body){
+        persistedText = body.replace(/\{\{(\d+)\}\}/g, (_, n) => {
+          const v = input.bodyParams[parseInt(n,10) - 1];
+          return v != null ? String(v) : `{{${n}}}`;
+        }).slice(0, 4000);
+      }
+    } catch {}
+    if (!persistedText){
+      persistedText = input.bodyParams.filter(Boolean).join("\n").slice(0, 4000) || `[template: ${input.templateName}]`;
+    }
+
+    const msg = await persistOutboundMessage({
+      conv, user: req.user, text: persistedText,
+      templateName: input.templateName,
+      providerMessageId: r1.messageId,
+      status: "sent"
+    });
+
+    res.status(201).json({
+      ok: true,
+      messageId: msg.id,
+      whatsappMessageId: r1.messageId,
+      templateName: input.templateName
+    });
+  } catch (e){ next(e); }
+});
+
+// ----- POST /conversations/:id/send-text ------------------------------------
+
+const sendTextSchema = z.object({
+  text: z.string().min(1).max(4000),
+  previewUrl: z.boolean().optional()
+});
+
+r.post("/conversations/:id/send-text", requireAuth, async (req, res, next) => {
+  try {
+    if (!isEnabled()) return res.status(503).json({ error: "whatsapp_cloud_disabled" });
+    const input = sendTextSchema.parse(req.body);
+    const { conv, error } = await loadConversationForUser(req.params.id, req.user);
+    if (error) return res.status(error.status).json({ error: error.message });
+
+    const to = getLeadPhone(conv.lead);
+    if (!to) return res.status(422).json({ error: "phone_unavailable" });
+
+    logger.info({
+      flow: "wa_cloud_send_text", convId: conv.id, leadId: conv.leadId,
+      sender: req.user.email, len: input.text.length
+    }, "📤 wa_cloud · enviando texto livre");
+
+    const r1 = await sendText({ to, text: input.text, previewUrl: !!input.previewUrl, phoneNumberId: conv.inboundPhoneId });
+
+    if (!r1.ok){
+      // Janela de 24h fechou · responde com hint pra UI cair pra template
+      if (r1.reengagement){
+        return res.status(409).json({
+          error: "reengagement_required",
+          hint: "Janela de 24h fechou. Envie um template oficial para reabrir a conversa.",
+          code: r1.code
+        });
+      }
+      return res.status(r1.status || 502).json({ error: "send_failed", reason: r1.error, code: r1.code, body: r1.body });
+    }
+
+    const msg = await persistOutboundMessage({
+      conv, user: req.user, text: input.text,
+      templateName: null,
+      providerMessageId: r1.messageId,
+      status: "sent"
+    });
+
+    res.status(201).json({
+      ok: true,
+      messageId: msg.id,
+      whatsappMessageId: r1.messageId
+    });
+  } catch (e){ next(e); }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// GET /api/whatsapp/numeros  — relatório de números da WABA + stats de envio
+// ──────────────────────────────────────────────────────────────────────────────
+r.get('/numeros', requireAuth, async (req, res, next) => {
+  try {
+    if (!['ADMIN','DEV'].includes(req.user.role)) return res.status(403).json({ error: 'forbidden' });
+    const { token, wabaId, graphVersion } = getConfig();
+
+    // 1) busca números + quality na Meta
+    const metaRes = await fetch(
+      `https://graph.facebook.com/${graphVersion}/${wabaId}/phone_numbers?fields=id,display_phone_number,quality_rating,status,health_status&limit=30&access_token=${token}`
+    );
+    const metaJson = await metaRes.json();
+    const metaPhones = metaJson.data || [];
+
+    // 2) stats de envio por phoneId via inboundPhoneId da Conversation
+    const rows = await db.$queryRaw`
+      SELECT
+        c."inboundPhoneId"                                                              AS phone_id,
+        COUNT(m.id) FILTER (WHERE m."createdAt" >= NOW()-INTERVAL '48 hours')           AS envios_48h,
+        COUNT(m.id) FILTER (WHERE m."createdAt" >= CURRENT_DATE)                        AS envios_hoje,
+        COUNT(m.id)                                                                      AS envios_total,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='read'      AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS lidas_48h,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='delivered' AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS entregues_48h,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='sent'      AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS enviadas_48h,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='failed'    AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS falhas_48h,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='failed' AND m."errorReason" LIKE '%131049%' AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS throttle_48h,
+        COUNT(m.id) FILTER (WHERE m."messageStatus"='failed' AND m."errorReason" LIKE '%131026%' AND m."createdAt" >= NOW()-INTERVAL '48 hours') AS no_wa_48h
+      FROM "Conversation" c
+      JOIN "Message" m ON m."conversationId" = c.id
+      WHERE m.direction = 'outbound'
+        AND c."inboundPhoneId" IS NOT NULL
+      GROUP BY c."inboundPhoneId"
+    `;
+
+    const statsMap = {};
+    for (const row of rows) {
+      statsMap[row.phone_id] = {
+        envios_48h:    Number(row.envios_48h),
+        envios_hoje:   Number(row.envios_hoje),
+        envios_total:  Number(row.envios_total),
+        lidas_48h:     Number(row.lidas_48h),
+        entregues_48h: Number(row.entregues_48h),
+        enviadas_48h:  Number(row.enviadas_48h),
+        falhas_48h:    Number(row.falhas_48h),
+        throttle_48h:  Number(row.throttle_48h),
+        no_wa_48h:     Number(row.no_wa_48h),
+      };
+    }
+
+    const numeros = metaPhones.map(p => {
+      const s    = statsMap[p.id] || {};
+      const h48  = s.envios_48h    || 0;
+      const lidas= s.lidas_48h     || 0;
+      const entre= s.entregues_48h || 0;
+      const env  = s.enviadas_48h  || 0;
+      return {
+        id:            p.id,
+        numero:        p.display_phone_number,
+        qualidade:     p.quality_rating,
+        status:        p.status,
+        canSend:       p.health_status?.can_send_message || 'UNKNOWN',
+        envios_hoje:   s.envios_hoje  || 0,
+        envios_48h:    h48,
+        envios_total:  s.envios_total || 0,
+        lidas_48h:     lidas,
+        entregues_48h: entre,
+        falhas_48h:    s.falhas_48h   || 0,
+        throttle_48h:  s.throttle_48h || 0,
+        no_wa_48h:     s.no_wa_48h    || 0,
+        taxa_sucesso:  h48 > 0 ? Math.round((lidas + entre + env) / h48 * 100) : null,
+      };
+    });
+
+    const totais = numeros.reduce((acc, n) => {
+      acc.envios_48h    += n.envios_48h;
+      acc.envios_hoje   += n.envios_hoje;
+      acc.lidas_48h     += n.lidas_48h;
+      acc.entregues_48h += n.entregues_48h;
+      acc.falhas_48h    += n.falhas_48h;
+      acc.throttle_48h  += n.throttle_48h;
+      return acc;
+    }, { envios_48h: 0, envios_hoje: 0, lidas_48h: 0, entregues_48h: 0, falhas_48h: 0, throttle_48h: 0 });
+
+    res.json({ ok: true, numeros, totais, geradoEm: new Date().toISOString() });
+  } catch (e) { next(e); }
+});
+
+export default r;

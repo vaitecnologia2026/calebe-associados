@@ -1,0 +1,722 @@
+// =============================================================================
+// /api/webhooks/whatsapp-cloud · receiver da Meta Cloud API
+//
+// - GET   handshake (hub.mode/hub.verify_token/hub.challenge)
+// - POST  recebe messages + status callbacks
+//
+// ATENÇÃO: monta com express.raw() para validar HMAC com body bruto. Roteador
+// SEPARADO de routes/webhooks.js para isolar responsabilidades — montado antes
+// de express.json() no server.js.
+//
+// Idempotência: dedupado por whatsappMessageId (Meta retransmite até 7d se
+// recebermos 5xx ou não respondermos em 20s).
+//
+// Webhook Payload Reference:
+//   https://developers.facebook.com/docs/whatsapp/cloud-api/webhooks/payload-examples
+// =============================================================================
+import { Router, raw } from "express";
+import path from "node:path";
+import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { db } from "../db.js";
+import { logger } from "../utils/logger.js";
+import { audit } from "../utils/audit.js";
+import { sha256Hex, normalizePhone, encrypt, maskPhone, phoneHashVariants } from "../crypto.js";
+import { chatUpsertConversation, chatInsertMessage } from "../chatDb.js";
+import { sseToMany, sseToAdmins } from "../services/sseHub.js";
+import { sendPushToUser } from "../services/push.js";
+import { notifyAssociateLeadReplied } from "../services/associateNotifier.js";
+import {
+  isEnabled,
+  verifyWebhookSubscription,
+  verifyWebhookSignature,
+  downloadInboundMedia,
+  sendText as cloudSendText
+} from "../services/whatsappCloud.js";
+
+// Diretório onde mídias inbound (áudio/imagem/vídeo/doc/sticker) são salvas.
+// Servido publicamente em /midias/inbound (server.js · express.static).
+// 2026-05-13 · ALINHADO COM server.js · MIDIAS_DIR = process.cwd()/../Midias.
+// Antes usava process.cwd() (sem ..) e arquivos iam pro backend/Midias enquanto
+// express.static servia de cima · TODOS retornavam 404. Bug do áudio da Josimari.
+const PROJECT_ROOT = path.resolve(process.cwd(), "..");
+const INBOUND_ROOT = path.join(PROJECT_ROOT, "Midias", "inbound");
+for (const sub of ["audio", "image", "video", "document", "sticker"]){
+  try { fs.mkdirSync(path.join(INBOUND_ROOT, sub), { recursive: true }); } catch {}
+}
+
+const execFileP = promisify(execFile);
+
+// 2026-06-03 · Áudio do WhatsApp vem em ogg/opus, que iPhone/Safari NÃO tocam.
+// Converte pra MP3 (libmp3lame) — toca em iOS, Android e desktop. Se falhar,
+// mantém o ogg (Android/PC ainda tocam). Mono 64k é ótimo p/ voz e leve.
+async function transcodeOggToMp3(inPath, outPath){
+  await execFileP("ffmpeg", [
+    "-y", "-i", inPath,
+    "-vn", "-codec:a", "libmp3lame", "-ac", "1", "-b:a", "64k",
+    outPath
+  ], { timeout: 20000 });
+}
+
+/**
+ * Baixa a mídia inbound da Meta (2-step Graph) e salva em disco.
+ * Retorna `{ fileUrl, fileName, mimeType }` ou null em falha (não bloqueia a
+ * persistência da mensagem · texto auxiliar fica visível mesmo sem o arquivo).
+ */
+async function _fetchAndStoreMedia({ mediaId, kind, originalFilename, waMessageId }){
+  if (!mediaId) return null;
+  try {
+    const { buffer, mimeType, extension } = await downloadInboundMedia(mediaId);
+    const safeId = String(waMessageId || mediaId).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+    const filename = `${Date.now()}-${safeId}.${extension}`;
+    const dir = path.join(INBOUND_ROOT, kind);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, filename), buffer);
+
+    // 2026-06-03 · áudio (ogg/opus) → mp3 pra tocar no iPhone também.
+    if (kind === "audio" && /ogg|opus/i.test(`${mimeType} ${extension}`)){
+      try {
+        const mp3Name = filename.replace(/\.[^.]+$/, "") + ".mp3";
+        await transcodeOggToMp3(path.join(dir, filename), path.join(dir, mp3Name));
+        return {
+          fileUrl:  `/midias/inbound/${kind}/${mp3Name}`,
+          fileName: (originalFilename || filename).replace(/\.[^.]+$/, "") + ".mp3",
+          mimeType: "audio/mpeg"
+        };
+      } catch (eT){
+        logger.warn({ err: eT.message, waMessageId }, "wa_cloud · transcode ogg→mp3 falhou · mantém ogg");
+      }
+    }
+
+    return {
+      fileUrl:  `/midias/inbound/${kind}/${filename}`,
+      fileName: originalFilename || filename,
+      mimeType
+    };
+  } catch (e){
+    logger.error({ err: e.message, mediaId, kind, waMessageId }, "wa_cloud · falha ao baixar mídia inbound");
+    return null;
+  }
+}
+
+const r = Router();
+
+// ----- GET /api/webhooks/whatsapp-cloud  · handshake da Meta ---------------
+
+r.get("/", (req, res) => {
+  if (!isEnabled()) return res.status(503).type("text/plain").send("disabled");
+  const mode      = String(req.query["hub.mode"] || "");
+  const token     = String(req.query["hub.verify_token"] || "");
+  const challenge = String(req.query["hub.challenge"] || "");
+  const result = verifyWebhookSubscription({ mode, token, challenge });
+  if (result.ok){
+    logger.info({ mode }, "✅ wa_cloud · webhook verify ok");
+    return res.status(200).type("text/plain").send(result.challenge);
+  }
+  logger.warn({ mode, err: result.error }, "❌ wa_cloud · webhook verify rejected");
+  return res.status(result.status || 403).type("text/plain").send(result.error || "rejected");
+});
+
+// ----- POST /api/webhooks/whatsapp-cloud · eventos -------------------------
+
+// Raw body parser (1MB limite, padrão da Meta)
+r.use(raw({ type: "*/*", limit: "1mb" }));
+
+r.post("/", async (req, res) => {
+  if (!isEnabled()) return res.status(503).json({ error: "disabled" });
+
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
+  const signature = req.headers["x-hub-signature-256"] || req.headers["x-hub-signature"] || "";
+
+  // HMAC check
+  if (!verifyWebhookSignature(rawBody, signature)){
+    await db.webhookInboundLog.create({
+      data: {
+        source: "whatsapp_cloud",
+        endpoint: "/api/webhooks/whatsapp-cloud",
+        rawPayload: {},
+        signature: String(signature || ""),
+        ipAddress: req.ip,
+        status: "REJECTED",
+        errorMessage: "invalid_hmac"
+      }
+    }).catch(()=>{});
+    logger.warn({ ip: req.ip, hasSig: Boolean(signature) }, "wa_cloud · HMAC invalido");
+    return res.status(401).json({ error: "invalid_signature" });
+  }
+
+  // Parse body
+  let event; try { event = JSON.parse(rawBody.toString("utf8") || "{}"); }
+  catch { return res.status(400).json({ error: "invalid_json" }); }
+
+  // Log centralizado
+  const inboundLog = await db.webhookInboundLog.create({
+    data: {
+      source: "whatsapp_cloud",
+      endpoint: "/api/webhooks/whatsapp-cloud",
+      rawPayload: event,
+      signature: String(signature || ""),
+      ipAddress: req.ip,
+      status: "PROCESSING"
+    }
+  });
+
+  // Responder 200 RAPIDO (Meta deslista webhook se demorar). Processamento real
+  // continua em background — mas precisa garantir persistência das partes
+  // críticas ANTES de responder pra não perder eventos (Meta NÃO retenta após 2xx).
+  // Estratégia: aguarda persistência das mensagens, MAS sse push e audit são fire-and-forget.
+  try {
+    const entries = Array.isArray(event.entry) ? event.entry : [];
+    let messagesProcessed = 0;
+    let statusesProcessed = 0;
+
+    for (const entry of entries){
+      const changes = Array.isArray(entry.changes) ? entry.changes : [];
+      for (const change of changes){
+        if (change.field !== "messages") continue;
+        const value = change.value || {};
+        const messages = Array.isArray(value.messages) ? value.messages : [];
+        const statuses = Array.isArray(value.statuses) ? value.statuses : [];
+        const contacts = Array.isArray(value.contacts) ? value.contacts : [];
+
+        // 2026-06-03 · Números exclusivos de SUPORTE — não criam leads nem conversas.
+        // Mensagens recebidas por esses phone_number_ids são ignoradas pelo pipeline
+        // de leads. Conversas já existentes no VAI CRM continuam ativas normalmente.
+        const SUPPORT_ONLY_PHONE_IDS = new Set([
+          "1143966188797246",  // +55 47 9211-7994 (suporte)
+          "1155522184305211",  // +55 47 9238-0420 (suporte)
+        ]);
+        const incomingPhoneId = String(value.metadata?.phone_number_id || "");
+        if (incomingPhoneId && SUPPORT_ONLY_PHONE_IDS.has(incomingPhoneId)){
+          logger.info({ phoneId: incomingPhoneId }, "📵 webhook · número de suporte · inbound ignorado pelo pipeline de leads");
+          continue; // pula o processamento de mensagens deste change
+        }
+
+        // Mapa wa_id -> profile.name (para nome do lead em inbound novo)
+        const profileByWaId = new Map();
+        for (const c of contacts){
+          if (c.wa_id) profileByWaId.set(String(c.wa_id), c.profile?.name || null);
+        }
+
+        for (const msg of messages){
+          try {
+            await processInboundMessage({ msg, value, profileName: profileByWaId.get(String(msg.from)) || null });
+            messagesProcessed++;
+          } catch (e){
+            logger.error({ err: e.message, msgId: msg.id }, "wa_cloud · falha ao processar inbound");
+          }
+        }
+
+        for (const s of statuses){
+          try {
+            await processStatus(s);
+            statusesProcessed++;
+          } catch (e){
+            logger.error({ err: e.message, msgId: s.id }, "wa_cloud · falha ao processar status");
+          }
+        }
+      }
+    }
+
+    await db.webhookInboundLog.update({
+      where: { id: inboundLog.id },
+      data: { status: "PROCESSED", errorMessage: `msgs=${messagesProcessed} statuses=${statusesProcessed}` }
+    }).catch(()=>{});
+    res.status(200).json({ ok: true });
+  } catch (e){
+    logger.error({ err: e.message }, "wa_cloud · erro fatal no processamento");
+    await db.webhookInboundLog.update({
+      where: { id: inboundLog.id },
+      data: { status: "REJECTED", errorMessage: e.message }
+    }).catch(()=>{});
+    res.status(500).json({ error: "processing_failed" });
+  }
+});
+
+// ----- Processadores --------------------------------------------------------
+
+/**
+ * Recebe uma message inbound do payload da Meta e persiste.
+ * Idempotente · dedup por whatsappMessageId.
+ */
+async function processInboundMessage({ msg, value, profileName }){
+  const waId = String(msg.from || "");      // ex: "5547988466727"
+  const waMessageId = String(msg.id || ""); // ex: "wamid.HBgN..."
+  if (!waId || !waMessageId) return;
+  // 2026-06-03 · EM QUAL número da Calebe o lead falou (a gente recebe em >1).
+  // A resposta TEM que sair por este mesmo número (janela 24h é por número).
+  const incomingPhoneId = String(value?.metadata?.phone_number_id || "") || null;
+
+  // Dedup · se já gravamos essa msg antes, sai
+  const existing = await db.message.findFirst({
+    where: { whatsappMessageId: waMessageId }, select: { id: true }
+  });
+  if (existing) return;
+
+  // Conteúdo da mensagem · text, image, audio, video, document, location, etc.
+  // Para tipos com mídia (audio/image/video/document/sticker), também baixa
+  // o binário da Meta e salva em /Midias/inbound/{kind}/ pra servir via /midias.
+  const contentInfo = await extractMessageContent(msg);
+
+  // Acha o Lead pelo telefone (variantes com/sem 9 do celular BR)
+  const phoneNorm = normalizePhone(waId);
+  const hashes = phoneHashVariants(phoneNorm);
+  const lead = await db.lead.findFirst({
+    where: { phoneHash: { in: hashes } },
+    include: { conversation: { include: { associate: { include: { user: { select: { id: true, name: true } } } } } } }
+  });
+
+  if (!lead){
+    // 2026-07-01 · CAPTAÇÃO pelo número oficial Meta (LP). Antes ignorava o inbound de
+    // número desconhecido; agora cria o lead. Se a 1ª msg trouxer "#CRECI<num>" (embutido
+    // pela LP do corretor), credita o lead àquele corretor; senão entra no bolsão.
+    try {
+      const _ref = String(contentInfo.text || "").match(/CRECI[\s:#-]*(\d{3,7})/i);
+      let _assignedToId = null, _corretorName = null;
+      if (_ref){
+        const _assoc = await db.associate.findFirst({
+          where: { creci: _ref[1], status: "APPROVED" },
+          select: { id: true, user: { select: { name: true } } }
+        }).catch(() => null);
+        if (_assoc){ _assignedToId = _assoc.id; _corretorName = _assoc.user?.name || null; }
+      }
+      const _novo = await db.lead.create({
+        data: {
+          name: (profileName || "").trim() || ("Lead WhatsApp " + maskPhone(phoneNorm)),
+          phoneEncrypted: encrypt(phoneNorm),
+          phoneHash: sha256Hex(phoneNorm),
+          phoneMasked: maskPhone(phoneNorm),
+          source: "lp",
+          origin: "WEBHOOK",
+          segment: "Regional",
+          status: "NEW",
+          assignedToId: _assignedToId
+        }
+      });
+      if (_assignedToId){
+        const _conv = await db.conversation.create({
+          data: { leadId: _novo.id, associateId: _assignedToId, inboundPhoneId: incomingPhoneId }
+        });
+        await db.message.create({
+          data: {
+            conversationId: _conv.id, direction: "inbound", fromRole: "lead",
+            text: contentInfo.text, contentType: contentInfo.type, fileUrl: contentInfo.fileUrl,
+            fileName: contentInfo.fileName, mimeType: contentInfo.mimeType,
+            provider: "whatsapp_cloud", whatsappMessageId: waMessageId, messageStatus: "received", deliveredAt: new Date()
+          }
+        });
+        await db.conversation.update({
+          where: { id: _conv.id },
+          data: { lastMessageAt: new Date(), lastInboundAt: new Date(), manualFree: true }
+        });
+        logger.info({ leadId: _novo.id, corretor: _corretorName, creci: _ref?.[1] }, "✅ wa_cloud · lead NOVO captado pela LP + creditado ao corretor");
+      } else {
+        logger.info({ leadId: _novo.id }, "✅ wa_cloud · lead NOVO captado pela LP (sem #CRECI) → bolsão p/ distribuição");
+      }
+    } catch (eCap){
+      logger.warn({ err: eCap.message, waId }, "wa_cloud · falha ao captar lead novo pela LP");
+    }
+    return;
+  }
+
+  // Acha/cria conversa
+  let conv = lead.conversation;
+  if (!conv){
+    // Lead distribuído mas conversa ainda não criada · cria com o associado
+    // que recebeu o lead (Lead.assignedToId)
+    if (!lead.assignedToId){
+      logger.warn({ leadId: lead.id, waMessageId }, "wa_cloud · lead sem associate atribuido · skip");
+      return;
+    }
+    conv = await db.conversation.create({
+      data: { leadId: lead.id, associateId: lead.assignedToId, inboundPhoneId: incomingPhoneId },
+      include: { associate: { include: { user: { select: { id: true, name: true } } } } }
+    });
+  }
+
+  // Persiste a mensagem
+  const message = await db.message.create({
+    data: {
+      conversationId: conv.id,
+      direction: "inbound",
+      fromRole: "lead",
+      text: contentInfo.text,
+      contentType: contentInfo.type,
+      fileUrl: contentInfo.fileUrl,
+      fileName: contentInfo.fileName,
+      mimeType: contentInfo.mimeType,
+      provider: "whatsapp_cloud",
+      whatsappMessageId: waMessageId,
+      messageStatus: "received",
+      deliveredAt: new Date()
+    }
+  });
+
+  // 2026-05-12 · Quando lead responde via Cloud API, abre janela de 24h pra texto livre.
+  // Marca manualFree=true (idempotente) pra UI desbloquear input livre.
+  // 2026-06-03 · lastInboundAt = FONTE AUTORITATIVA da janela de 24h (ver
+  // services/whatsappWindow.js). Gravado com o timestamp REAL do inbound.
+  await db.conversation.update({
+    where: { id: conv.id },
+    // 2026-06-03 · grava o número em que o lead falou → o envio sai por ele.
+    data: { lastMessageAt: new Date(), lastInboundAt: message.createdAt, manualFree: true, ...(incomingPhoneId ? { inboundPhoneId: incomingPhoneId } : {}) }
+  });
+
+  // 2026-06-30 · Re-engajamento cancela blacklist temporária de 131049.
+  // Se o lead estava em pausa (qualidade) e respondeu → janela aberta, libera o contato.
+  // Pausa permanente (invalid_number, opted_out) NÃO é cancelada.
+  if (lead.noWhatsApp && (lead.blacklistReason === '131049_temp_3d' || lead.blacklistReason === '131049_temp')) {
+    await db.lead.update({
+      where: { id: lead.id },
+      data: { noWhatsApp: false, noWhatsAppAt: null, blacklistReason: null }
+    }).catch(e => logger.warn({ leadId: lead.id, err: e.message }, 'wa_cloud · falha ao cancelar blacklist 131049 no re-engajamento'));
+    logger.info({ leadId: lead.id, leadName: lead.name, motivo: lead.blacklistReason }, '✅ lead re-engajou → blacklist 131049 cancelado automaticamente');
+  }
+
+  // 2026-07-01 · Campanha: se o lead respondeu a um disparo recente, marca resposta.
+  // (É o gatilho da roleta na Fase 2: cliente que respondeu → corretor online.)
+  try {
+    const camprec = await db.campaignRecipient.findFirst({
+      where: { leadId: lead.id, status: 'sent' },
+      orderBy: { sentAt: 'desc' }
+    });
+    if (camprec) {
+      await db.campaignRecipient.update({ where: { id: camprec.id }, data: { status: 'responded', respondedAt: new Date(), roletaStatus: 'pending', roletaAssignedAt: new Date(), roletaHolderId: lead.assignedToId ?? null } });
+      await db.campaign.update({ where: { id: camprec.campaignId }, data: { statResponded: { increment: 1 } } });
+      logger.info({ leadId: lead.id, campaignId: camprec.campaignId }, '📣 campanha · lead respondeu o disparo');
+    }
+  } catch (eCamp) { logger.warn({ err: eCamp.message, leadId: lead.id }, 'campanha · falha ao marcar resposta'); }
+
+  // Chat DB · espelha
+  try {
+    await chatUpsertConversation({
+      id: conv.id,
+      leadId: lead.id,
+      leadName: lead.name,
+      leadPhone: phoneNorm,
+      leadPhoneMask: lead.phoneMasked || maskPhone(phoneNorm),
+      vaiPhone: phoneNorm
+    });
+    await chatInsertMessage({
+      conversationId: conv.id,
+      direction: "inbound",
+      fromRole: "lead",
+      content: contentInfo.text,
+      contentType: contentInfo.type,
+      fileUrl: contentInfo.fileUrl,
+      vaiMessageId: null,
+      metadata: { provider: "whatsapp_cloud", whatsappMessageId: waMessageId, profileName },
+      deliveredAt: new Date()
+    });
+  } catch (e){
+    logger.warn({ err: e.message, convId: conv.id }, "wa_cloud · chatDb persist inbound failed");
+  }
+
+  // SSE push para o dono (associate) + admins · em background pra não atrasar 200
+  const ownerIds = conv.associate?.userId ? [conv.associate.userId] : [];
+  const inboundPayload = {
+    conversationId: conv.id,
+    messageId: message.id,
+    leadId: lead.id,
+    leadName: lead.name,
+    text: contentInfo.text,
+    contentType: contentInfo.type,
+    provider: "whatsapp_cloud",
+    createdAt: message.createdAt,
+    // 2026-06-03 · `at` é o campo que o handler do front lê (upsertMessage) —
+    // antes vinha undefined e caía em "agora". Agora manda o timestamp real.
+    at: message.createdAt,
+    // 2026-06-03 · sinal da janela: inbound ACABOU de chegar → janela ABERTA.
+    // A UI deve liberar o input livre e remover a exigência de template na hora.
+    windowOpen: true,
+    requiresTemplate: false,
+    lastInboundAt: message.createdAt,
+    windowExpiresAt: new Date(new Date(message.createdAt).getTime() + 24 * 60 * 60 * 1000)
+  };
+  sseToMany(ownerIds, "message.inbound", inboundPayload);
+  // 2026-05-12 · admins também recebem (painel TV ao vivo, monitoramento)
+  if (typeof sseToAdmins === "function") sseToAdmins("message.inbound", inboundPayload);
+
+  // Push notification (web push VAPID · best-effort)
+  if (conv.associate?.userId){
+    sendPushToUser(conv.associate.userId, {
+      eventKey: "lead.replied",
+      title: `${lead.name}`,
+      body: contentInfo.text.slice(0, 120),
+      data: { conversationId: conv.id, leadId: lead.id }
+    }).catch(()=>{});
+  }
+
+  // 2026-05-13 · WhatsApp notify ao corretor · template calebe_lead_respondeu.
+  // Why: corretor precisa receber aviso no proprio WhatsApp (PWA push pode estar
+  // off). Debounce 5min ja embutido em associateNotifier.
+  if (conv.associateId){
+    notifyAssociateLeadReplied({
+      associateId: conv.associateId,
+      leadId: lead.id,
+      leadName: lead.name
+    }).catch((e) => logger.warn({ err: e.message, convId: conv.id }, "associateNotifier lead_respondeu falhou (nao-fatal)"));
+  }
+
+  logger.info({
+    flow: "wa_cloud_inbound",
+    convId: conv.id, leadId: lead.id, leadName: lead.name,
+    waMessageId, contentType: contentInfo.type, preview: contentInfo.text.slice(0, 60)
+  }, "📥 wa_cloud · mensagem recebida do lead");
+
+  await audit({ action: "WA_CLOUD_INBOUND", entity: `Message:${message.id}`, metadata: { conversationId: conv.id, whatsappMessageId: waMessageId } });
+
+  // 2026-05-13 · DRAIN · ao receber resposta do lead, reenvia mensagens que
+  // ficaram em "queued_for_resend" (failed por janela 24h fechada). Janela
+  // agora esta aberta, da pra entregar tudo. Em background, nao bloqueia 200.
+  drainQueuedOutbound({ conversationId: conv.id, leadName: lead.name, phone: phoneNorm })
+    .catch((e) => logger.warn({ err: e.message, convId: conv.id }, "🔁 drain · excecao top-level"));
+}
+
+// 2026-05-13 · Drain de mensagens "queued_for_resend" apos resposta do lead.
+// Why: corretor mandou texto enquanto janela 24h estava fechada, Meta bloqueou
+// (131047/131049/130472). Marcamos como queued. Quando lead responder, janela
+// abre e podemos entregar.
+async function drainQueuedOutbound({ conversationId, leadName, phone }){
+  const queued = await db.message.findMany({
+    where: {
+      conversationId,
+      direction: "outbound",
+      messageStatus: "queued_for_resend"
+    },
+    orderBy: { createdAt: "asc" }
+  });
+  if (!queued.length) return;
+  const phoneDigits = String(phone || "").replace(/\D/g, "");
+  if (!phoneDigits){
+    logger.warn({ conversationId, leadName }, "🔁 drain · sem phone, abortando");
+    return;
+  }
+  logger.info({ conversationId, leadName, count: queued.length, phone: phoneDigits }, "🔁 drain · iniciando reenvio de mensagens presas");
+  let okCount = 0, failCount = 0;
+  for (const m of queued){
+    const text = (m.text || "").trim();
+    if (!text){
+      // Sem texto util · descarta status para nao reenviar
+      await db.message.update({ where: { id: m.id }, data: { messageStatus: "skipped_empty" } }).catch(()=>{});
+      continue;
+    }
+    try {
+      const r = await cloudSendText({ to: phoneDigits, text });
+      if (r.ok){
+        await db.message.update({
+          where: { id: m.id },
+          data: {
+            provider: "whatsapp_cloud",
+            messageStatus: "sent",
+            whatsappMessageId: r.messageId || m.whatsappMessageId,
+            failedAt: null,
+            errorReason: null,
+            deliveredAt: new Date()
+          }
+        });
+        okCount++;
+        logger.info({ conversationId, msgId: m.id, waMsgId: r.messageId, preview: text.slice(0,60) }, "🔁 drain · reenvio OK");
+      } else {
+        await db.message.update({
+          where: { id: m.id },
+          data: {
+            messageStatus: "failed",
+            failedAt: new Date(),
+            errorReason: `drain_retry_failed:${r.code || ""}:${(r.error || "").slice(0, 200)}`
+          }
+        }).catch(()=>{});
+        failCount++;
+        logger.warn({ conversationId, msgId: m.id, code: r.code, err: r.error }, "🔁 drain · reenvio falhou");
+      }
+    } catch (e){
+      failCount++;
+      logger.error({ conversationId, msgId: m.id, err: e.message }, "🔁 drain · excecao no reenvio");
+    }
+    // Pequena pausa entre envios pra nao estourar rate-limit Meta
+    await new Promise(rs => setTimeout(rs, 350));
+  }
+  logger.info({ conversationId, leadName, okCount, failCount, total: queued.length }, "🔁 drain · concluido");
+}
+
+/** Atualiza Message com status callback (sent/delivered/read/failed). */
+async function processStatus(s){
+  const waMessageId = String(s.id || "");
+  if (!waMessageId) return;
+  // 2026-05-13 · Carrega conversa+associate para empurrar SSE pro corretor dono.
+  // Why: status failed (131047 re-engagement) precisa aparecer pro corretor
+  // na UI · sem isso, ele acha que mandou e mensagem nao chegou.
+  const msg = await db.message.findFirst({
+    where: { whatsappMessageId: waMessageId },
+    select: {
+      id: true,
+      conversationId: true,
+      conversation: { select: { associate: { select: { userId: true } } } }
+    }
+  });
+  if (!msg){
+    // Não temos essa msg local · pode ser um status que chegou antes do POST de envio
+    // ter persistido localmente. Tolerável.
+    return;
+  }
+  const data = { messageStatus: String(s.status || "unknown") };
+  if (s.status === "delivered") data.deliveredAt = new Date();
+  if (s.status === "read")      data.readAt = new Date();
+  if (s.status === "failed"){
+    data.failedAt = new Date();
+    const err = Array.isArray(s.errors) ? s.errors[0] : null;
+    data.errorReason = err ? `${err.code || ""}:${err.title || err.message || ""}`.slice(0, 500) : "unknown";
+  }
+  await db.message.update({ where: { id: msg.id }, data });
+
+  // 2026-06-30 · 131026/131050 = blacklist permanente imediato. 131049 = temporario apos 3+ falhas em 7d.
+  const PERMANENT_CODES = ["131026", "131050"];
+  const BLACKLIST_REASON = { "131026": "invalid_number", "131050": "opted_out" };
+  const _permCode = PERMANENT_CODES.find(c => data.errorReason?.startsWith(c));
+  const _is131049 = false; // 2026-07-01 · 131049 NÃO blacklista mais (throttle de qualidade do número, não do lead — round-robin GREEN/YELLOW/RED trata).
+  if (s.status === "failed" && (_permCode || _is131049)){
+    try {
+      const conv2 = await db.conversation.findUnique({
+        where: { id: msg.conversationId },
+        select: { leadId: true }
+      });
+      if (conv2?.leadId){
+        if (_permCode) {
+          await db.lead.update({
+            where: { id: conv2.leadId },
+            data: { noWhatsApp: true, noWhatsAppAt: new Date(), blacklistReason: BLACKLIST_REASON[_permCode], blacklistedAt: new Date(), updatedAt: new Date() }
+          });
+          logger.info({ leadId: conv2.leadId, code: _permCode }, "lead blacklistado permanente " + _permCode);
+        } else if (_is131049) {
+          const since7d = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+          const fail131049 = await db.message.count({
+            where: { conversationId: msg.conversationId, messageStatus: "failed", createdAt: { gte: since7d } }
+          }).catch(() => 0);
+          if (fail131049 >= 3) {
+            const leadChk = await db.lead.findUnique({ where: { id: conv2.leadId }, select: { noWhatsApp: true } }).catch(() => null);
+            if (!leadChk?.noWhatsApp) {
+              await db.lead.update({
+                where: { id: conv2.leadId },
+                data: { noWhatsApp: true, noWhatsAppAt: new Date(), blacklistReason: "131049_temp", blacklistedAt: new Date(), updatedAt: new Date() }
+              });
+              logger.info({ leadId: conv2.leadId, fails: fail131049 }, "lead blacklistado temp 7d 131049");
+            }
+          }
+        }
+      }
+    } catch (eWp){ logger.warn({ err: eWp.message }, "blacklist update falhou"); }
+  }
+
+  // Push SSE pro frontend atualizar ticks do whatsapp na UI (corretor dono + admins).
+  const ownerUserId = msg.conversation?.associate?.userId || null;
+  const targets = ownerUserId ? [ownerUserId] : [];
+  sseToMany(targets, "message.status", {
+    conversationId: msg.conversationId,
+    messageId: msg.id,
+    whatsappMessageId: waMessageId,
+    status: s.status,
+    ...(data.failedAt ? { failedAt: data.failedAt, errorReason: data.errorReason } : {})
+  });
+}
+
+// ----- Extrator de conteúdo das mensagens -----------------------------------
+
+async function extractMessageContent(msg){
+  const type = String(msg.type || "text");
+  const waMessageId = String(msg.id || "");
+  switch (type){
+    case "text":
+      return { type: "text", text: String(msg.text?.body || ""), fileUrl: null, fileName: null, mimeType: null };
+    case "image": {
+      const stored = await _fetchAndStoreMedia({ mediaId: msg.image?.id, kind: "image", waMessageId });
+      return {
+        type: "image",
+        text: msg.image?.caption || "[imagem]",
+        fileUrl: stored?.fileUrl || null,
+        fileName: stored?.fileName || null,
+        mimeType: stored?.mimeType || msg.image?.mime_type || "image/jpeg"
+      };
+    }
+    case "audio": {
+      const stored = await _fetchAndStoreMedia({ mediaId: msg.audio?.id, kind: "audio", waMessageId });
+      return {
+        type: "audio",
+        text: "[áudio]",
+        fileUrl: stored?.fileUrl || null,
+        fileName: stored?.fileName || null,
+        mimeType: stored?.mimeType || msg.audio?.mime_type || "audio/ogg"
+      };
+    }
+    case "video": {
+      const stored = await _fetchAndStoreMedia({ mediaId: msg.video?.id, kind: "video", waMessageId });
+      return {
+        type: "video",
+        text: msg.video?.caption || "[vídeo]",
+        fileUrl: stored?.fileUrl || null,
+        fileName: stored?.fileName || null,
+        mimeType: stored?.mimeType || msg.video?.mime_type || "video/mp4"
+      };
+    }
+    case "document": {
+      const stored = await _fetchAndStoreMedia({
+        mediaId: msg.document?.id,
+        kind: "document",
+        originalFilename: msg.document?.filename || null,
+        waMessageId
+      });
+      return {
+        type: "document",
+        text: msg.document?.caption || msg.document?.filename || "[documento]",
+        fileUrl: stored?.fileUrl || null,
+        fileName: stored?.fileName || msg.document?.filename || null,
+        mimeType: stored?.mimeType || msg.document?.mime_type || "application/octet-stream"
+      };
+    }
+    case "sticker": {
+      const stored = await _fetchAndStoreMedia({ mediaId: msg.sticker?.id, kind: "sticker", waMessageId });
+      return {
+        type: "sticker",
+        text: "[figurinha]",
+        fileUrl: stored?.fileUrl || null,
+        fileName: stored?.fileName || null,
+        mimeType: stored?.mimeType || "image/webp"
+      };
+    }
+    case "location":
+      return {
+        type: "text",
+        text: `[localização] lat:${msg.location?.latitude} lng:${msg.location?.longitude}${msg.location?.name ? " · " + msg.location.name : ""}`,
+        fileUrl: null, fileName: null, mimeType: null
+      };
+    case "button":
+    case "interactive": {
+      const btnText = msg.button?.text || msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || "[interação]";
+      return { type: "text", text: String(btnText), fileUrl: null, fileName: null, mimeType: null };
+    }
+    case "reaction":
+      return { type: "text", text: `[reagiu: ${msg.reaction?.emoji || ""}]`, fileUrl: null, fileName: null, mimeType: null };
+    case "contacts": {
+      const arr = Array.isArray(msg.contacts) ? msg.contacts : [];
+      const linhas = arr.map(c => {
+        const nome = c?.name?.formatted_name
+          || [c?.name?.first_name, c?.name?.last_name].filter(Boolean).join(" ")
+          || c?.name?.first_name
+          || "(sem nome)";
+        const fones = Array.isArray(c?.phones) ? c.phones : [];
+        const foneStr = fones.map(p => p?.phone || p?.wa_id).filter(Boolean).join(", ");
+        const emails = Array.isArray(c?.emails) ? c.emails.map(e => e?.email).filter(Boolean).join(", ") : "";
+        const parts = [`📇 ${nome}`];
+        if (foneStr) parts.push(foneStr);
+        if (emails) parts.push(emails);
+        return parts.join(" · ");
+      });
+      const text = linhas.length ? linhas.join("\n") : "[contato compartilhado]";
+      return { type: "text", text, fileUrl: null, fileName: null, mimeType: null };
+    }
+    default:
+      return { type: "text", text: `[${type}]`, fileUrl: null, fileName: null, mimeType: null };
+  }
+}
+
+export default r;

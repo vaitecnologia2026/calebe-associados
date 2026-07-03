@@ -1,0 +1,725 @@
+// =============================================================================
+// WhatsApp Cloud API · cliente para envio e leitura via Meta Graph API
+//
+// Decisão arquitetural 2026-05-11: comunicação corretor↔lead migra de VAI
+// (WhatsApp Web) para Meta Cloud API oficial. VAI segue para notificações
+// internas (template `leads_para_atendimento` via n8n da VaiDaVenda).
+//
+// Docs:
+// - Graph API:        https://developers.facebook.com/docs/whatsapp/cloud-api
+// - Templates:        https://developers.facebook.com/docs/whatsapp/business-management-api/message-templates
+// - Webhooks:         https://developers.facebook.com/docs/whatsapp/webhooks
+// =============================================================================
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { logger } from "../utils/logger.js";
+import { readFileSync } from "node:fs";
+
+const DEFAULT_GRAPH_VERSION = "v25.0";
+
+// ----- Config + flag --------------------------------------------------------
+
+export function isEnabled(){
+  return process.env.WHATSAPP_CLOUD_ENABLED === "true";
+}
+
+/** Lê config do env. Lança se faltar var obrigatória — chame só quando precisar. */
+function getConfig(){
+  const required = ["WHATSAPP_CLOUD_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_WABA_ID"];
+  const missing = required.filter(k => !process.env[k]);
+  if (missing.length) throw new Error(`whatsapp_cloud_config_missing: ${missing.join(",")}`);
+  return {
+    token:         process.env.WHATSAPP_CLOUD_TOKEN,
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+    wabaId:        process.env.WHATSAPP_WABA_ID,
+    appSecret:     process.env.WHATSAPP_APP_SECRET || "",
+    verifyToken:   process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || "",
+    graphVersion:  process.env.WHATSAPP_GRAPH_VERSION || DEFAULT_GRAPH_VERSION
+  };
+}
+
+// 2026-06-03 · ROTEAMENTO MULTI-NÚMERO.
+// A Calebe recebe leads em MAIS de um número (ex.: 9252-3020 e 8846-6727), mas
+// historicamente só ENVIAVA pelo número fixo do env. Como a janela de 24h da
+// Meta é POR número, responder por um número diferente do que o cliente usou
+// gera 131047 ("cliente nunca respondeu"). Esta função resolve por qual número
+// enviar: usa o `requested` (o número em que o lead falou com a gente), desde
+// que esteja na allowlist de números habilitados pra envio; senão cai no padrão.
+function sendablePhoneIds(){
+  const def = process.env.WHATSAPP_PHONE_NUMBER_ID || "";
+  const extra = (process.env.WHATSAPP_SENDABLE_PHONE_IDS || "")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  return new Set([def, ...extra].filter(Boolean));
+}
+// 2026-06-11 · SAÚDE DINÂMICA: a rotina _ia_saude_numeros.mjs (cron) consulta a Meta
+// e mantém data/healthy_phones.json com os números GREEN. Os envios de mensagem NOVA
+// (templates/round-robin) usam só esses; se o arquivo sumir/envelhecer (>6h), cai no env.
+// Respostas (com inboundPhoneId) NÃO passam por aqui — mantêm o número da janela 24h.
+const HEALTHY_PHONES_FILE = process.env.HEALTHY_PHONES_FILE || "/root/vaidavenda-calebe/backend/data/healthy_phones.json";
+let _healthyCache = { t: 0, ids: null };
+function loadHealthyIds(){
+  const now = Date.now();
+  if (now - _healthyCache.t < 60000) return _healthyCache.ids;
+  _healthyCache.t = now;
+  try {
+    const j = JSON.parse(readFileSync(HEALTHY_PHONES_FILE, "utf8"));
+    if (!j.updatedAt || (now - j.updatedAt) > 6 * 3600 * 1000) { _healthyCache.ids = null; return null; }
+    const ids = Array.isArray(j.greenIds) ? j.greenIds.filter(Boolean) : [];
+    _healthyCache.ids = ids.length ? ids : null;
+  } catch { _healthyCache.ids = null; }
+  return _healthyCache.ids;
+}
+// 2026-06-12 · Números EXCLUSIVOS de suporte — NUNCA enviam mensagem nova a lead.
+// Mesma lista do webhook (inbound ignorado). O cron de saúde marcava o suporte
+// como GREEN e o round-robin acabava mandando msg de lead pelo 9211-7994. Trava aqui.
+const SUPPORT_ONLY_PHONE_IDS = new Set(
+  (process.env.SUPPORT_ONLY_PHONE_IDS || "1143966188797246,1155522184305211")
+    .split(",").map(x => x.trim()).filter(Boolean)
+);
+// 2026-06-10 · Pool exclusivo para NOVOS leads (sem inboundPhoneId).
+// Apenas números GREEN sem o número de suporte técnico (9211-7994).
+// YELLOW e RED continuam em sendablePhoneIds() para conversas em andamento.
+function newLeadPhoneIds(){
+  const healthy = loadHealthyIds();
+  let base;
+  if (healthy && healthy.length) base = healthy;
+  else {
+    const ids = (process.env.WHATSAPP_NEW_LEAD_PHONE_IDS || "")
+      .split(",").map(s => s.trim()).filter(Boolean);
+    base = ids.length ? ids : [...sendablePhoneIds()];
+  }
+  // Remove suporte SEMPRE, mesmo que o healthy_phones.json o inclua (defesa em profundidade).
+  return new Set([...base].filter(id => !SUPPORT_ONLY_PHONE_IDS.has(id)));
+}
+// 2026-06-09 · round-robin index · por instância PM2.
+// Distribui envios de templates iniciais (sem inboundPhoneId) entre todos os
+// números habilitados, mantendo carga igual e qualidade GREEN em todos.
+let _rrIdx = 0;
+function _nextRoundRobinPhone(){
+  const ids = [...newLeadPhoneIds()];
+  if (!ids.length) return getConfig().phoneNumberId;
+  const id = ids[_rrIdx % ids.length];
+  _rrIdx = (_rrIdx + 1) % ids.length;
+  return id;
+}
+export function resolveSendPhoneId(requested){
+  const req = requested ? String(requested).trim() : "";
+  // Phone específico válido (e NÃO suporte): usa ele · mantém thread do lead no mesmo número.
+  if (req && !SUPPORT_ONLY_PHONE_IDS.has(req) && sendablePhoneIds().has(req)) return req;
+  // Sem phone (ou suporte): round-robin entre os números habilitados (já sem suporte).
+  return _nextRoundRobinPhone();
+}
+
+// ----- HTTP helper ----------------------------------------------------------
+
+class WhatsAppCloudError extends Error {
+  constructor(message, { status, body, code }){
+    super(message);
+    this.name = "WhatsAppCloudError";
+    this.status = status;
+    this.body = body;
+    this.code = code;
+  }
+}
+
+async function graph(path, { method = "GET", body, query } = {}){
+  const { token, graphVersion } = getConfig();
+  let url = `https://graph.facebook.com/${graphVersion}${path.startsWith("/") ? path : "/" + path}`;
+  if (query){
+    const usp = new URLSearchParams(Object.entries(query).filter(([_, v]) => v != null));
+    if (usp.toString()) url += `?${usp}`;
+  }
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  let parsed; try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+  if (!res.ok){
+    const err = parsed?.error || {};
+    throw new WhatsAppCloudError(err.message || `graph_${res.status}`, {
+      status: res.status, body: parsed, code: err.code
+    });
+  }
+  return parsed;
+}
+
+// ----- Templates ------------------------------------------------------------
+
+const _tplCache = { at: 0, data: null };
+const _TPL_TTL_MS = 5 * 60 * 1000;
+// 2026-06-12 · Resiliência: Meta Graph falha intermitente (OAuthException code 2 transient).
+// Sem isso a rota 500ava e o corretor via \"Nenhum template liberado\".
+// Camadas: cache em memória (5min) → stale em memória → cache em disco (sobrevive restart).
+import { readFileSync as _tplReadFs, writeFileSync as _tplWriteFs } from "node:fs";
+const _TPL_DISK_PATH = new URL("../../.tpl-cache.json", import.meta.url).pathname;
+function _tplSaveDisk(data){
+  try { _tplWriteFs(_TPL_DISK_PATH, JSON.stringify({ at: Date.now(), data })); } catch { /* best-effort */ }
+}
+function _tplLoadDisk(){
+  try {
+    const j = JSON.parse(_tplReadFs(_TPL_DISK_PATH, "utf8"));
+    return Array.isArray(j?.data) && j.data.length ? j.data : null;
+  } catch { return null; }
+}
+
+/**
+ * Lista templates do WABA. Em produção a Calebe tem ~3-6 templates ativos,
+ * então puxar TODOS num GET só (sem paginação agressiva) é suficiente.
+ *
+ * @param {Object} opts
+ * @param {boolean} opts.bypassCache  Pula cache de 5min (útil em admin)
+ * @param {string}  opts.status       APPROVED | PENDING | REJECTED (filtro)
+ */
+export async function listTemplates({ bypassCache = false, status = "APPROVED" } = {}){
+  const now = Date.now();
+  if (!bypassCache && _tplCache.data && now - _tplCache.at < _TPL_TTL_MS){
+    return _tplCache.data.filter(t => !status || t.status === status);
+  }
+  const { wabaId } = getConfig();
+  try {
+    const res = await graph(`/${wabaId}/message_templates`, {
+      query: { limit: 100, fields: "name,status,category,language,components,quality_score" }
+    });
+    const data = Array.isArray(res?.data) ? res.data : [];
+    if (data.length){
+      _tplCache.at = now;
+      _tplCache.data = data;
+      _tplSaveDisk(data);
+    }
+    if (data.length) return data.filter(t => !status || t.status === status);
+    // Resposta vazia inesperada · cai pro stale
+    throw Object.assign(new Error("meta_empty_template_list"), { transient: true });
+  } catch (e){
+    // 1º fallback · stale em memória (mesmo expirado)
+    if (Array.isArray(_tplCache.data) && _tplCache.data.length){
+      logger?.warn?.({ err: e.message }, "listTemplates · Meta falhou · servindo cache stale (memória)");
+      return _tplCache.data.filter(t => !status || t.status === status);
+    }
+    // 2º fallback · cache em disco (sobrevive restart do PM2)
+    const disk = _tplLoadDisk();
+    if (disk){
+      _tplCache.at = now;
+      _tplCache.data = disk;
+      return disk.filter(t => !status || t.status === status);
+    }
+    throw e;
+  }
+}
+
+/** Limpa cache de templates (chamar após editar/criar template no Business Manager). */
+export function clearTemplateCache(){
+  _tplCache.at = 0;
+  _tplCache.data = null;
+  _headerMediaCache.clear();
+  _headerUploadInFlight.clear();
+}
+
+// ----- Resolução automática de header media (vídeo/imagem/documento) --------
+// Quando o template tem HEADER com mídia obrigatória, baixamos o sample
+// aprovado da Meta (example.header_handle), fazemos upload em /media,
+// e cacheamos o media_id por (templateName::language) para reuso.
+// Meta mantém media por 30 dias · refrescamos com TTL de 25d.
+
+const _headerMediaCache = new Map();      // key -> { mediaId, uploadedAt, format }
+const _headerUploadInFlight = new Map();  // key -> Promise (lock anti-corrida)
+const _HEADER_MEDIA_TTL_MS = 25 * 24 * 60 * 60 * 1000;
+
+function _mimeFor(format){
+  switch (String(format).toUpperCase()){
+    case "VIDEO":    return { mime: "video/mp4",      ext: "mp4" };
+    case "IMAGE":    return { mime: "image/jpeg",     ext: "jpg" };
+    case "DOCUMENT": return { mime: "application/pdf", ext: "pdf" };
+    default: return null;
+  }
+}
+
+async function _downloadHandle(url){
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download_handle_failed_${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function _uploadMedia(buffer, mime, filename, phoneIdOverride){
+  const { token, graphVersion } = getConfig();
+  // 2026-06-03 · sobe a mídia no MESMO número que vai enviar (media id é por número).
+  const phoneNumberId = resolveSendPhoneId(phoneIdOverride);
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("type", mime);
+  form.append("file", new Blob([buffer], { type: mime }), filename);
+  const url = `https://graph.facebook.com/${graphVersion}/${phoneNumberId}/media`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form
+  });
+  const txt = await res.text();
+  let parsed; try { parsed = JSON.parse(txt); } catch { parsed = { raw: txt }; }
+  if (!res.ok || !parsed?.id){
+    throw new Error(`upload_media_failed_${res.status}_${String(parsed?.error?.message || txt).slice(0, 120)}`);
+  }
+  return parsed.id;
+}
+
+/**
+ * Resolve o {mediaId, format} para o header de mídia de um template.
+ * Retorna null se o template não tem header de mídia (texto-só ou sem header).
+ * Lança em erro de download/upload.
+ */
+async function _resolveHeaderMediaId(template){
+  const headerComp = (template?.components || []).find(
+    c => String(c.type).toUpperCase() === "HEADER"
+  );
+  if (!headerComp) return null;
+  const format = String(headerComp.format || "TEXT").toUpperCase();
+  const mimeInfo = _mimeFor(format);
+  if (!mimeInfo) return null;  // TEXT ou formato não suportado
+
+  const handles = headerComp.example?.header_handle;
+  const handleUrl = Array.isArray(handles) ? handles[0] : null;
+  if (!handleUrl) return null;
+
+  const key = `${template.name}::${template.language}`;
+
+  // Cache hit válido
+  const cached = _headerMediaCache.get(key);
+  if (cached && Date.now() - cached.uploadedAt < _HEADER_MEDIA_TTL_MS){
+    return { mediaId: cached.mediaId, format };
+  }
+
+  // Concurrency lock · se outra requisição já está fazendo o upload, espera
+  if (_headerUploadInFlight.has(key)){
+    const r = await _headerUploadInFlight.get(key);
+    return { mediaId: r.mediaId, format };
+  }
+
+  const work = (async () => {
+    try {
+      logger.info({ template: template.name, language: template.language, format }, "wa_cloud · baixando header sample da Meta CDN");
+      const buffer = await _downloadHandle(handleUrl);
+      const filename = `${template.name}_header.${mimeInfo.ext}`;
+      const mediaId = await _uploadMedia(buffer, mimeInfo.mime, filename);
+      const entry = { mediaId, uploadedAt: Date.now(), format };
+      _headerMediaCache.set(key, entry);
+      logger.info({ template: template.name, language: template.language, format, mediaId, bytes: buffer.length }, "✅ wa_cloud · header media cached");
+      return entry;
+    } finally {
+      _headerUploadInFlight.delete(key);
+    }
+  })();
+  _headerUploadInFlight.set(key, work);
+  const r = await work;
+  return { mediaId: r.mediaId, format };
+}
+
+// ----- Envio ----------------------------------------------------------------
+
+/**
+ * Envia mensagem de TEMPLATE (única opção fora da janela de 24h).
+ *
+ * Quando o template tem HEADER com mídia obrigatória (VIDEO/IMAGE/DOCUMENT) e
+ * o chamador NÃO passa `headerParams`, baixamos o sample aprovado da Meta CDN
+ * e anexamos automaticamente. Cache de 25d por (templateName::language).
+ *
+ * @param {Object} args
+ * @param {string} args.to            Telefone E.164 sem '+' (ex: "5547988466727")
+ * @param {string} args.templateName  Nome do template aprovado (ex: "calebe_abordagem_inicial")
+ * @param {string} args.languageCode  Código BCP-47 (ex: "pt_BR" ou "en")
+ * @param {Array}  args.bodyParams    Array de strings, em ordem, para {{1}}, {{2}}, {{3}}...
+ * @param {Array}  args.headerParams  Opcional · header com texto/imagem/vídeo (formato Meta). Se null/omitido E template tem header de mídia, auto-resolve do sample aprovado.
+ * @returns {{ok: true, messageId: string, raw: object} | {ok: false, error: string, status: number, body: object}}
+ */
+// 2026-07-01 · Qualidade OFICIAL Meta por número (GREEN/YELLOW/RED). Cache 5min.
+let _phoneQ = { at: 0, data: null };
+export async function getPhoneNumbersQuality({ bypassCache = false } = {}){
+  const now = Date.now();
+  if (!bypassCache && _phoneQ.data && now - _phoneQ.at < 5 * 60 * 1000) return _phoneQ.data;
+  try {
+    const { wabaId } = getConfig();
+    const res = await graph(`/${wabaId}/phone_numbers`, { query: { fields: "id,display_phone_number,quality_rating", limit: 50 } });
+    const data = {};
+    (res?.data || []).forEach(n => { data[n.id] = { number: n.display_phone_number, quality: n.quality_rating || "UNKNOWN" }; });
+    if (Object.keys(data).length) _phoneQ = { at: now, data };
+    return _phoneQ.data || data;
+  } catch { return _phoneQ.data || {}; }
+}
+
+export async function sendTemplate({ to, templateName, languageCode, bodyParams = [], headerParams = null, urlButtonParams = [], phoneNumberId: phoneIdOverride = null } = {}){
+  if (!isEnabled()) return { ok: false, error: "whatsapp_cloud_disabled", status: 503 };
+  if (!to || !templateName || !languageCode){
+    return { ok: false, error: "missing_required", status: 400 };
+  }
+  // 2026-06-03 · roteamento multi-número: envia pelo número que o lead usou.
+  const phoneNumberId = resolveSendPhoneId(phoneIdOverride);
+
+  // Auto-resolução de header media quando caller não passou
+  let effectiveHeader = headerParams;
+  let autoResolvedFormat = null;
+  if (!effectiveHeader){
+    try {
+      const templates = await listTemplates({ status: "APPROVED" });
+      const template = templates.find(t => t.name === templateName && t.language === languageCode);
+      if (template){
+        const r = await _resolveHeaderMediaId(template);
+        if (r){
+          const mediaType = r.format.toLowerCase();  // video | image | document
+          effectiveHeader = [{ type: mediaType, [mediaType]: { id: r.mediaId } }];
+          autoResolvedFormat = r.format;
+        }
+      } else {
+        logger.warn({ templateName, languageCode }, "wa_cloud · template não encontrado no cache · forçando refresh");
+        const fresh = await listTemplates({ bypassCache: true, status: "APPROVED" });
+        const t2 = fresh.find(t => t.name === templateName && t.language === languageCode);
+        if (t2){
+          const r = await _resolveHeaderMediaId(t2);
+          if (r){
+            const mediaType = r.format.toLowerCase();
+            effectiveHeader = [{ type: mediaType, [mediaType]: { id: r.mediaId } }];
+            autoResolvedFormat = r.format;
+          }
+        }
+      }
+    } catch (e){
+      logger.warn({ templateName, languageCode, err: e.message }, "wa_cloud · auto-resolve header media falhou · seguindo sem (Meta pode rejeitar)");
+    }
+  }
+
+  const components = [];
+  if (effectiveHeader) components.push({ type: "header", parameters: effectiveHeader });
+  if (bodyParams.length){
+    components.push({
+      type: "body",
+      parameters: bodyParams.map(t => ({ type: "text", text: String(t ?? "") }))
+    });
+  }
+  // 2026-05-11 · URL button params · pra templates com botão URL dinâmico
+  // urlButtonParams = [{ index: 0, value: "token123" }] · cada entrada vira
+  // um component "button" no payload Meta (sub_type=url, index posicional).
+  for (const b of (urlButtonParams || [])){
+    if (!b || b.value == null) continue;
+    components.push({
+      type: "button",
+      sub_type: "url",
+      index: String(b.index ?? 0),
+      parameters: [{ type: "text", text: String(b.value) }]
+    });
+  }
+  const payload = {
+    messaging_product: "whatsapp",
+    to: String(to).replace(/\D/g, ""),
+    type: "template",
+    template: {
+      name: templateName,
+      language: { code: languageCode },
+      ...(components.length ? { components } : {})
+    }
+  };
+  try {
+    const res = await graph(`/${phoneNumberId}/messages`, { method: "POST", body: payload });
+    const messageId = res?.messages?.[0]?.id || null;
+    logger.info({ to: payload.to, templateName, messageId, autoHeader: autoResolvedFormat }, "📤 whatsapp_cloud · template enviado");
+    return { ok: true, messageId, raw: res, sentPhoneId: phoneNumberId };
+  } catch (e){
+    logger.warn({ to: payload.to, templateName, status: e.status, code: e.code, err: e.message }, "❌ whatsapp_cloud · template falhou");
+    return { ok: false, error: e.message, status: e.status, body: e.body, code: e.code };
+  }
+}
+
+/**
+ * Envia mensagem de TEXTO LIVRE (só funciona dentro da janela de 24h após o
+ * lead ter respondido). Fora dessa janela a Meta retorna erro 131047/131026.
+ *
+ * @param {Object} args
+ * @param {string} args.to    Telefone E.164 sem '+'
+ * @param {string} args.text  Conteúdo da mensagem (até 4096 caracteres)
+ * @param {boolean} args.previewUrl  Se true, mostra preview do link (default false)
+ */
+// 131047 (Re-engagement) / 131026 (Receiver inactive) = janela de 24h fechada
+// NAQUELE número. Como a Calebe recebe em vários números WABA e a janela é por
+// número, tentar OUTRO número habilitado costuma entregar (o lead respondeu lá).
+const _isWindowErr = (e) => !!e && (e.code === 131047 || e.code === 131026);
+
+// Ordem de tentativa: número resolvido primeiro, depois os demais habilitados.
+// DEFESA DURÁVEL: mesmo que o chamador esqueça de passar inboundPhoneId (já
+// regrediu 1x), o auto-heal abaixo entrega pelo número certo. NÃO remover.
+export function candidatePhoneIds(requested){
+  const primary = resolveSendPhoneId(requested);
+  // rest NUNCA pode conter suporte (fallback não pode vazar pro 9211-7994/9238-0420).
+  const rest = [...sendablePhoneIds()].filter(id => id && id !== primary && !SUPPORT_ONLY_PHONE_IDS.has(id));
+  return [primary, ...rest];
+}
+
+export async function sendText({ to, text, previewUrl = false, phoneNumberId: phoneIdOverride = null } = {}){
+  if (!isEnabled()) return { ok: false, error: "whatsapp_cloud_disabled", status: 503 };
+  if (!to || !text) return { ok: false, error: "missing_required", status: 400 };
+  const payload = {
+    messaging_product: "whatsapp",
+    to: String(to).replace(/\D/g, ""),
+    type: "text",
+    text: { body: String(text).slice(0, 4096), preview_url: !!previewUrl }
+  };
+  const cands = candidatePhoneIds(phoneIdOverride);
+  let lastErr = null;
+  for (let i = 0; i < cands.length; i++){
+    const pid = cands[i];
+    try {
+      const res = await graph(`/${pid}/messages`, { method: "POST", body: payload });
+      const messageId = res?.messages?.[0]?.id || null;
+      if (i > 0) logger.warn({ to: payload.to, sentFrom: pid, triedFirst: cands.slice(0, i) }, "♻ whatsapp_cloud · texto entregue por número ALTERNATIVO (auto-heal multi-número)");
+      else logger.info({ to: payload.to, messageId, len: payload.text.body.length }, "📤 whatsapp_cloud · texto enviado");
+      return { ok: true, messageId, raw: res, sentPhoneId: pid };
+    } catch (e){
+      lastErr = e;
+      // 2026-07-01 · Rate-limit transitório (burst da cota do número): reenvia no MESMO número após backoff.
+      // Trocar de número NÃO resolve (janela de 24h é por-número); esperar o burst passar SIM.
+      // Cobre o caso "cliente respondeu, janela aberta, mas msg livre caiu por throttle momentâneo".
+      const _RATE_CODES = [130429, 131048, 80007, 133016];
+      if (_RATE_CODES.includes(Number(e.code))){
+        for (const _wait of [2500, 7000]){
+          await new Promise(r => setTimeout(r, _wait));
+          try {
+            const res = await graph(`/${pid}/messages`, { method: "POST", body: payload });
+            const messageId = res?.messages?.[0]?.id || null;
+            logger.warn({ to: payload.to, sentFrom: pid, waitedMs: _wait, code: e.code }, "♻ whatsapp_cloud · texto ENTREGUE após retry de rate-limit (janela aberta preservada)");
+            return { ok: true, messageId, raw: res, sentPhoneId: pid, recoveredRateLimit: true };
+          } catch (e2){ lastErr = e2; if (!_RATE_CODES.includes(Number(e2.code))) break; }
+        }
+        break; // esgotou retries de rate-limit
+      }
+      if (!_isWindowErr(e)) break; // erro não-janela: trocar de número não resolve
+      logger.warn({ to: payload.to, from: pid, code: e.code, next: cands[i + 1] || null }, "↻ whatsapp_cloud · 131047 nesse número · tentando o próximo");
+    }
+  }
+  const e = lastErr || {};
+  const reengagement = _isWindowErr(e);
+  logger.warn({ to: payload.to, status: e.status, code: e.code, reengagement, err: e.message }, "❌ whatsapp_cloud · texto falhou em TODOS os números");
+  return { ok: false, error: e.message, status: e.status, body: e.body, code: e.code, reengagement };
+}
+
+// ----- Envio de mídia (audio/image/video/document) -------------------------
+// 2026-05-15 · Antes só tínhamos sendText/sendTemplate via Cloud · mídia inteira
+// caía pra VAI, que estava silenciosamente perdendo áudio na entrega. Agora o
+// fluxo audio→lead também passa pela Cloud (uploadMedia + messages com type=audio).
+
+/**
+ * Upload de mídia outbound · 2-step:
+ *   1. POST /{phone_number_id}/media (multipart) → retorna { id }
+ *   2. POST /{phone_number_id}/messages com { type:"audio", audio:{ id } }
+ *
+ * Aceita os mimes que a Meta WABA aceita pra cada tipo:
+ *   - audio: audio/aac, audio/amr, audio/mpeg, audio/mp4, audio/ogg (opus, ≤16MB)
+ *   - image: image/jpeg, image/png (≤5MB)
+ *   - video: video/mp4, video/3gp (≤16MB)
+ *   - document: pdf, doc(x), xls(x), ppt(x), txt (≤100MB)
+ *   - sticker: image/webp (animado ≤500KB, estático ≤100KB)
+ *
+ * @returns mediaId (string)
+ */
+export async function uploadMedia({ buffer, mimeType, filename, phoneNumberId: phoneIdOverride = null } = {}){
+  if (!isEnabled()) throw new Error("whatsapp_cloud_disabled");
+  if (!buffer || !mimeType) throw new Error("missing_buffer_or_mime");
+  return _uploadMedia(buffer, mimeType, filename || `upload.${(mimeType.split("/")[1]||"bin")}`, phoneIdOverride);
+}
+
+/**
+ * Envia mensagem de mídia já uploadada · só funciona dentro da janela 24h.
+ * Para audio, NÃO usa caption (WhatsApp ignora). Para image/video/document, usa.
+ *
+ * @param {Object} args
+ * @param {string} args.to        Telefone E.164 sem '+'
+ * @param {string} args.mediaId   Retorno de uploadMedia()
+ * @param {string} args.type      audio | image | video | document | sticker
+ * @param {string} [args.caption] Legenda (image/video/document)
+ * @param {string} [args.filename] Nome exibido (document)
+ * @returns {{ok,messageId,raw}|{ok:false,error,status,body,code,reengagement}}
+ */
+export async function sendMedia({ to, mediaId, type, caption = "", filename = "", phoneNumberId: phoneIdOverride = null } = {}){
+  if (!isEnabled()) return { ok: false, error: "whatsapp_cloud_disabled", status: 503 };
+  if (!to || !mediaId || !type) return { ok: false, error: "missing_required", status: 400 };
+  // 2026-06-03 · roteamento multi-número: envia pelo número que o lead usou.
+  const phoneNumberId = resolveSendPhoneId(phoneIdOverride);
+  const obj = { id: mediaId };
+  if (type === "image" || type === "video" || type === "document"){
+    if (caption) obj.caption = String(caption).slice(0, 1024);
+  }
+  if (type === "document" && filename) obj.filename = String(filename).slice(0, 240);
+  const payload = {
+    messaging_product: "whatsapp",
+    to: String(to).replace(/\D/g, ""),
+    type,
+    [type]: obj
+  };
+  try {
+    const res = await graph(`/${phoneNumberId}/messages`, { method: "POST", body: payload });
+    const messageId = res?.messages?.[0]?.id || null;
+    logger.info({ to: payload.to, type, mediaId, messageId }, "📤 whatsapp_cloud · mídia enviada");
+    return { ok: true, messageId, raw: res };
+  } catch (e){
+    const reengagement = e.code === 131047 || e.code === 131026;
+    logger.warn({ to: payload.to, type, status: e.status, code: e.code, reengagement, err: e.message }, "❌ whatsapp_cloud · mídia falhou");
+    return { ok: false, error: e.message, status: e.status, body: e.body, code: e.code, reengagement };
+  }
+}
+
+// Upload + envio de mídia com a MESMA defesa multi-número do sendText: tenta o
+// número resolvido e, em erro de janela, RE-UPLOADA e reenvia pelos demais
+// (o mediaId é POR número, então re-upload é obrigatório). Use ESTE no chat.
+// DEFESA DURÁVEL: independe do chamador lembrar do inboundPhoneId. NÃO remover.
+export async function uploadAndSendMedia({ to, buffer, mimeType, filename, type, caption = "", phoneNumberId: phoneIdOverride = null } = {}){
+  if (!isEnabled()) return { ok: false, error: "whatsapp_cloud_disabled", status: 503 };
+  if (!to || !buffer || !mimeType || !type) return { ok: false, error: "missing_required", status: 400 };
+  const cands = candidatePhoneIds(phoneIdOverride);
+  const fname = filename || `upload.${(mimeType.split("/")[1] || "bin")}`;
+  let lastErr = null;
+  for (let i = 0; i < cands.length; i++){
+    const pid = cands[i];
+    try {
+      const mediaId = await _uploadMedia(buffer, mimeType, fname, pid);
+      const r = await sendMedia({ to, mediaId, type, caption, filename: fname, phoneNumberId: pid });
+      if (r.ok){
+        if (i > 0) logger.warn({ to, sentFrom: pid }, "\u267b whatsapp_cloud \u00b7 m\u00eddia entregue por n\u00famero ALTERNATIVO (auto-heal multi-n\u00famero)");
+        return { ...r, mediaId, sentPhoneId: pid };
+      }
+      lastErr = { code: r.code, status: r.status, message: r.error, body: r.body };
+      if (!_isWindowErr(r)) break;
+      logger.warn({ to, from: pid, code: r.code, next: cands[i + 1] || null }, "\u21bb whatsapp_cloud \u00b7 m\u00eddia 131047 nesse n\u00famero \u00b7 tentando o pr\u00f3ximo");
+    } catch (e){
+      lastErr = e;
+      if (!_isWindowErr(e)) break;
+    }
+  }
+  const e = lastErr || {};
+  return { ok: false, error: e.message || e.error, status: e.status, body: e.body, code: e.code, reengagement: _isWindowErr(e) };
+}
+
+// ----- Webhook helpers ------------------------------------------------------
+
+/**
+ * GET handshake da Meta · Meta dispara um GET pra validar o endpoint na
+ * configuração do webhook. Responder com `hub.challenge` em texto plano.
+ *
+ * @returns {{ok: true, challenge: string} | {ok: false, status: number}}
+ */
+export function verifyWebhookSubscription({ mode, token, challenge }){
+  const { verifyToken } = getConfig();
+  if (!verifyToken) return { ok: false, status: 503, error: "verify_token_not_configured" };
+  if (mode !== "subscribe") return { ok: false, status: 403, error: "invalid_mode" };
+  if (!token || !challenge) return { ok: false, status: 400, error: "missing_params" };
+  if (token.length !== verifyToken.length) return { ok: false, status: 403, error: "invalid_token" };
+  try {
+    const ok = timingSafeEqual(Buffer.from(token), Buffer.from(verifyToken));
+    if (!ok) return { ok: false, status: 403, error: "invalid_token" };
+    return { ok: true, challenge: String(challenge) };
+  } catch {
+    return { ok: false, status: 403, error: "invalid_token" };
+  }
+}
+
+/**
+ * Verifica HMAC SHA-256 da Meta no header X-Hub-Signature-256.
+ * O App Secret (não o System User token) é a chave do HMAC.
+ *
+ * @param {Buffer|string} rawBody  Body raw da requisição
+ * @param {string} signatureHeader  Valor de X-Hub-Signature-256 (formato "sha256=...")
+ * @returns {boolean}
+ */
+export function verifyWebhookSignature(rawBody, signatureHeader){
+  const { appSecret } = getConfig();
+  if (!appSecret) return false;
+  if (!signatureHeader || !rawBody) return false;
+  const sig = String(signatureHeader);
+  const given = sig.startsWith("sha256=") ? sig.slice(7) : sig;
+  const expected = createHmac("sha256", appSecret).update(rawBody).digest("hex");
+  try {
+    return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(given, "hex"));
+  } catch {
+    return false;
+  }
+}
+
+// ----- Download de mídia inbound -------------------------------------------
+
+/**
+ * Baixa uma mídia inbound da Meta Cloud API (2 passos):
+ *   1. GET /{mediaId}            → metadata { url, mime_type, sha256, file_size }
+ *   2. GET url (com Bearer)      → binário (URL expira em ~5min)
+ *
+ * Retorna { buffer, mimeType, sha256, fileSize, extension } ou lança erro.
+ */
+export async function downloadInboundMedia(mediaId){
+  if (!mediaId) throw new Error("missing_media_id");
+  const { token, graphVersion } = getConfig();
+
+  const metaUrl = `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(mediaId)}`;
+  const metaRes = await fetch(metaUrl, { headers: { Authorization: `Bearer ${token}` } });
+  if (!metaRes.ok){
+    const body = await metaRes.text().catch(()=>"");
+    throw new Error(`media_meta_${metaRes.status}: ${body.slice(0,200)}`);
+  }
+  const meta = await metaRes.json();
+  if (!meta?.url) throw new Error("media_meta_missing_url");
+
+  const binRes = await fetch(meta.url, { headers: { Authorization: `Bearer ${token}` } });
+  if (!binRes.ok){
+    const body = await binRes.text().catch(()=>"");
+    throw new Error(`media_bin_${binRes.status}: ${body.slice(0,200)}`);
+  }
+  const arrayBuf = await binRes.arrayBuffer();
+  const buffer = Buffer.from(arrayBuf);
+  const mimeType = meta.mime_type || binRes.headers.get("content-type") || "application/octet-stream";
+  const extension = _extFromMime(mimeType);
+  return { buffer, mimeType, sha256: meta.sha256 || null, fileSize: buffer.length, extension };
+}
+
+function _extFromMime(mime){
+  const m = String(mime || "").toLowerCase().split(";")[0].trim();
+  const map = {
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/aac": "aac",
+    "audio/webm": "webm",
+    "audio/wav": "wav",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "video/3gpp": "3gp",
+    "video/webm": "webm",
+    "application/pdf": "pdf",
+    "application/zip": "zip",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"
+  };
+  return map[m] || (m.split("/")[1] || "bin").replace(/[^a-z0-9]/g, "").slice(0, 5);
+}
+
+// ----- Marcadores ------------------------------------------------------------
+
+/**
+ * Marca uma mensagem inbound como "lida" no WhatsApp (cria os 2 ticks azuis
+ * pro lead). Opcional · útil pra UX quando o corretor abre a conversa no CRM.
+ */
+export async function markAsRead(messageId){
+  if (!isEnabled()) return { ok: false, error: "whatsapp_cloud_disabled" };
+  if (!messageId) return { ok: false, error: "missing_message_id" };
+  const { phoneNumberId } = getConfig();
+  try {
+    await graph(`/${phoneNumberId}/messages`, {
+      method: "POST",
+      body: { messaging_product: "whatsapp", status: "read", message_id: messageId }
+    });
+    return { ok: true };
+  } catch (e){
+    return { ok: false, error: e.message, status: e.status };
+  }
+}

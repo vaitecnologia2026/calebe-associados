@@ -1,0 +1,150 @@
+// =============================================================================
+// services/campaignRunner.js · 2026-07-01
+// Worker de disparo de campanha (Central de Campanhas). Paceado por intervalo,
+// usa números GREEN (round-robin) ou os números escolhidos, respeita pausa.
+// Fase 1: só dispara + registra resultado. Roleta = Fase 2.
+// =============================================================================
+import { db } from "../db.js";
+import { logger } from "../utils/logger.js";
+import { decrypt, normalizePhone } from "../crypto.js";
+import { sendTemplate, listTemplates, resolveSendPhoneId, isEnabled } from "./whatsappCloud.js";
+
+const running = new Set(); // campaignIds em execucao NESTE worker (evita duplo-run)
+
+function firstName(name){
+  if (!name) return "";
+  const t = String(name).trim().split(/\s+/).filter(x => /[A-Za-zÀ-ÿ]{2,}/.test(x))[0] || "";
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
+}
+
+// Mesma convenção do frontend: templates "corretor-first" → [corretor, lead].
+const CORRETOR_FIRST = new Set([
+  "calebe_corretor_apresenta", "calebe_corretora_apresenta",
+  "calebe_reabordagem_v1", "calebe_reabordagem_v2"
+]);
+function buildParams(templateName, varCount, leadName, corretorName){
+  const lead = firstName(leadName) || "tudo bem";
+  const corr = firstName(corretorName) || "Calebe";
+  if (varCount <= 0) return [];
+  if (varCount === 1) return [lead];
+  if (CORRETOR_FIRST.has(templateName)) return [corr, lead];
+  return Array.from({ length: varCount }, () => lead);
+}
+
+export async function runCampaign(campaignId){
+  if (running.has(campaignId)) return;
+  running.add(campaignId);
+  try {
+    if (!isEnabled()){ logger.warn({ campaignId }, "campaignRunner · whatsapp cloud desabilitado"); return; }
+    const camp = await db.campaign.findUnique({ where: { id: campaignId } });
+    if (!camp || camp.status !== "running") return;
+
+    // quantas variáveis o template tem (pra preencher params certo)
+    let varCount = 1;
+    try {
+      const tpls = await listTemplates({ status: "APPROVED" });
+      const t = tpls.find(x => x.name === camp.templateName);
+      const body = (t?.components || []).find(c => c.type === "BODY");
+      varCount = (String(body?.text || "").match(/\{\{\d+\}\}/g) || []).length;
+    } catch { /* usa default 1 */ }
+
+    const interval = Math.max(1000, camp.intervalMs || 8000);
+    let rr = 0;
+
+    while (true){
+      // recarrega status a cada iteração → permite pausar/cancelar
+      const fresh = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true } });
+      if (!fresh || fresh.status !== "running") break;
+
+      // claim atômico · impede que 2 workers do cluster peguem o mesmo recipient (envio duplicado)
+      const _claim = await db.$queryRawUnsafe(`
+        UPDATE "CampaignRecipient" SET status='sending'
+        WHERE id = (SELECT id FROM "CampaignRecipient" WHERE "campaignId"=$1 AND status='queued' ORDER BY "createdAt" ASC LIMIT 1 FOR UPDATE SKIP LOCKED)
+        RETURNING id, "leadId"
+      `, campaignId);
+      const rec = _claim[0] ? { id: _claim[0].id, leadId: _claim[0].leadId } : null;
+      if (!rec){
+        await db.campaign.update({ where: { id: campaignId }, data: { status: "done", finishedAt: new Date() } });
+        logger.info({ campaignId }, "✅ campaignRunner · campanha concluída");
+        break;
+      }
+
+      const lead = await db.lead.findUnique({
+        where: { id: rec.leadId },
+        select: { id: true, name: true, phoneEncrypted: true, noWhatsApp: true, assignedToId: true, firstContactAt: true }
+      });
+
+      if (!lead || lead.noWhatsApp){
+        await db.campaignRecipient.update({ where: { id: rec.id }, data: { status: "no_whatsapp", errorReason: "blacklist" } });
+        await db.campaign.update({ where: { id: campaignId }, data: { statNoWhatsapp: { increment: 1 } } });
+        continue;
+      }
+
+      let to = null;
+      try { to = normalizePhone(decrypt(lead.phoneEncrypted)); } catch { /* noop */ }
+      if (!to){
+        await db.campaignRecipient.update({ where: { id: rec.id }, data: { status: "no_whatsapp", errorReason: "sem_telefone" } });
+        await db.campaign.update({ where: { id: campaignId }, data: { statNoWhatsapp: { increment: 1 } } });
+        continue;
+      }
+
+      // nome do corretor dono (pra templates corretor-first); senão "Calebe"
+      let corretorName = null;
+      if (lead.assignedToId){
+        const a = await db.associate.findUnique({ where: { id: lead.assignedToId }, select: { user: { select: { name: true } } } }).catch(() => null);
+        corretorName = a?.user?.name || null;
+      }
+
+      // número: escolhido na campanha (round-robin entre os selecionados) ou GREEN automático
+      let reqPhone = null;
+      if (Array.isArray(camp.phoneNumberIds) && camp.phoneNumberIds.length){
+        reqPhone = camp.phoneNumberIds[rr % camp.phoneNumberIds.length];
+      }
+      const phoneId = resolveSendPhoneId(reqPhone); // valida + cai em GREEN se inválido
+      rr++;
+
+      const params = buildParams(camp.templateName, varCount, lead.name, corretorName);
+      const resp = await sendTemplate({
+        to, templateName: camp.templateName, languageCode: camp.languageCode,
+        bodyParams: params, phoneNumberId: phoneId
+      });
+
+      if (resp.ok){
+        await db.campaignRecipient.update({
+          where: { id: rec.id },
+          data: { status: "sent", phoneId: resp.sentPhoneId || phoneId, waMessageId: resp.messageId || null, sentAt: new Date() }
+        });
+        await db.campaign.update({ where: { id: campaignId }, data: { statSent: { increment: 1 } } });
+        if (!lead.firstContactAt){
+          await db.lead.update({ where: { id: lead.id }, data: { firstContactAt: new Date() } }).catch(() => {});
+        }
+      } else {
+        const isNoWa = resp.code === 131026 || resp.code === 131050;
+        await db.campaignRecipient.update({
+          where: { id: rec.id },
+          data: { status: isNoWa ? "no_whatsapp" : "failed", errorReason: String(resp.code || resp.error || "erro").slice(0, 60) }
+        });
+        await db.campaign.update({
+          where: { id: campaignId },
+          data: isNoWa ? { statNoWhatsapp: { increment: 1 } } : { statFailed: { increment: 1 } }
+        });
+      }
+
+      await new Promise(res => setTimeout(res, interval));
+    }
+  } catch (e){
+    logger.error({ err: e.message, campaignId }, "campaignRunner · exceção");
+    await db.campaign.update({ where: { id: campaignId }, data: { status: "error" } }).catch(() => {});
+  } finally {
+    running.delete(campaignId);
+  }
+}
+
+// Retoma campanhas que ficaram "running" após restart do PM2.
+export async function resumeRunningCampaigns(){
+  try {
+    const camps = await db.campaign.findMany({ where: { status: "running" }, select: { id: true } });
+    for (const c of camps) runCampaign(c.id);
+    if (camps.length) logger.info({ n: camps.length }, "campaignRunner · retomando campanhas running após boot");
+  } catch (e){ logger.warn({ err: e.message }, "campaignRunner · falha ao retomar"); }
+}

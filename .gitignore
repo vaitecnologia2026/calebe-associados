@@ -1,0 +1,28 @@
+# deps / build
+node_modules/
+**/node_modules/
+dist/
+build/
+frontend/dist/
+
+# logs / caches
+*.log
+.tpl-cache.json
+.DS_Store
+
+# SEGREDOS — nunca versionar (.env.example é a única exceção)
+.env
+.env.local
+.env.*.local
+.env.bak*
+.env.pre-*
+**/.env
+**/.env.local
+**/.env.bak*
+**/.env.pre-*
+*.pem
+*.p8
+*.p12
+*.key
+**/serviceAccount*.json
+**/*firebase-adminsdk*.json
